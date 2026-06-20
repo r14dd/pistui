@@ -253,7 +253,7 @@ mod tests {
         ];
         let (tree, _) = build_tree(&observations);
         // The orphan attaches under its declared parent key "nonexistent",
-        // which won't match any node — it remains a separate root-level group.
+        // which won't match any node, so it remains a separate root-level group.
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].name, "root");
     }

@@ -12,6 +12,28 @@
     back.href = '#/';
     hdr.appendChild(back);
     hdr.appendChild(el('h2', null, data.trace.name || data.trace.id));
+
+    var headerActions = el('div', 'detail-header-actions');
+    var copyId = el('button', 'btn btn-sm copy-id-btn', 'copy ID');
+    copyId.title = data.trace.id;
+    copyId.addEventListener('click', function () {
+      navigator.clipboard.writeText(data.trace.id).then(function () {
+        copyId.textContent = 'copied';
+        setTimeout(function () { copyId.textContent = 'copy ID'; }, 1500);
+      });
+    });
+    headerActions.appendChild(copyId);
+
+    var config = window.appConfig || {};
+    if (config.langfuseHost) {
+      var lfLink = el('a', 'btn btn-sm langfuse-link', 'open in Langfuse ↗');
+      lfLink.href = config.langfuseHost.replace(/\/$/, '') + '/trace/' + encodeURIComponent(data.trace.id);
+      lfLink.target = '_blank';
+      lfLink.rel = 'noopener';
+      headerActions.appendChild(lfLink);
+    }
+
+    hdr.appendChild(headerActions);
     container.appendChild(hdr);
 
     container.appendChild(renderStats(data.stats));
@@ -23,7 +45,7 @@
     var treeFilter = el('div', 'filter-bar');
     var input = el('input', 'filter-input');
     input.type = 'text';
-    input.placeholder = 'filter spans…  (/ to focus)';
+    input.placeholder = 'filter by name, model, status, kind…  (/ to focus)';
     input.addEventListener('input', function (e) {
       filterTree(treeContainer, e.target.value.toLowerCase());
       selectedRow = null;
@@ -126,7 +148,7 @@
 
   function renderStats(stats) {
     var bar = el('div', 'stats-bar');
-    stat(bar, 'Duration', stats.totalDurationMs != null ? fmtDuration(stats.totalDurationMs) : '—', 'stat-duration');
+    stat(bar, 'Duration', stats.totalDurationMs != null ? fmtDuration(stats.totalDurationMs) : '-', 'stat-duration');
     stat(bar, 'Spans', stats.spanCount);
     stat(bar, 'Generations', stats.generationCount);
     stat(bar, 'Events', stats.eventCount);
@@ -148,6 +170,9 @@
     var wrapper = el('div', 'tree-node depth-' + depth);
     wrapper.dataset.name = (node.name || '').toLowerCase();
     wrapper.dataset.id = node.id;
+    wrapper.dataset.status = node.status || '';
+    wrapper.dataset.model = (node.model || '').toLowerCase();
+    wrapper.dataset.kind = (node.kind || '').toLowerCase();
 
     var row = el('div', 'node-row');
 
@@ -166,6 +191,17 @@
     var nameEl = el('span', 'node-name', node.name);
     if (node.status === 'error') nameEl.classList.add('node-status-error');
     row.appendChild(nameEl);
+
+    var copySpan = el('span', 'copy-span-id', '⎘');
+    copySpan.title = 'Copy span ID: ' + node.id;
+    copySpan.addEventListener('click', function (e) {
+      e.stopPropagation();
+      navigator.clipboard.writeText(node.id).then(function () {
+        copySpan.textContent = '✓';
+        setTimeout(function () { copySpan.textContent = '⎘'; }, 1200);
+      });
+    });
+    row.appendChild(copySpan);
 
     if (node.model) {
       row.appendChild(el('span', 'node-model', node.model));
@@ -234,7 +270,7 @@
     }
 
     var tip = node.name;
-    if (node.durationMs != null) tip += ' — ' + fmtDuration(node.durationMs);
+    if (node.durationMs != null) tip += ' - ' + fmtDuration(node.durationMs);
     bar.title = tip;
 
     container.appendChild(bar);
@@ -304,6 +340,8 @@
     tabs.appendChild(tab);
   }
 
+  window.renderSingleNode = renderNode;
+
   function filterTree(container, query) {
     var nodes = container.querySelectorAll('.tree-node');
     if (!query) {
@@ -312,9 +350,11 @@
     }
     nodes.forEach(function (n) { n.style.display = 'none'; });
     nodes.forEach(function (n) {
-      if (n.dataset.name && n.dataset.name.includes(query)) {
-        showWithAncestors(n);
-      }
+      var matches = (n.dataset.name && n.dataset.name.includes(query)) ||
+        (n.dataset.status && n.dataset.status.includes(query)) ||
+        (n.dataset.model && n.dataset.model.includes(query)) ||
+        (n.dataset.kind && n.dataset.kind.includes(query));
+      if (matches) showWithAncestors(n);
     });
   }
 

@@ -8,7 +8,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use pistui::cache::TraceCache;
 use pistui::langfuse;
-use pistui::server::router;
+use pistui::server::{router, router_with_state, AppState};
 
 async fn setup() -> (axum::Router, MockServer) {
     let mock = MockServer::start().await;
@@ -384,6 +384,146 @@ async fn explain_without_key_returns_400() {
         .as_str()
         .unwrap()
         .contains("no LLM configured"));
+}
+
+// --- GET /api/config (extended) ---
+
+#[tokio::test]
+async fn config_returns_langfuse_host() {
+    let mock = MockServer::start().await;
+    let client = langfuse::Client::with_base_url(mock.uri());
+    let cache = Arc::new(TraceCache::new(client));
+    let state = Arc::new(AppState {
+        cache,
+        env_explain: None,
+        langfuse_host: Some("https://cloud.langfuse.com".into()),
+        focus_trace: None,
+    });
+    let app = router_with_state(state);
+
+    let resp = app.oneshot(get("/api/config")).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(data["langfuseHost"], "https://cloud.langfuse.com");
+}
+
+#[tokio::test]
+async fn config_returns_focus_trace() {
+    let mock = MockServer::start().await;
+    let client = langfuse::Client::with_base_url(mock.uri());
+    let cache = Arc::new(TraceCache::new(client));
+    let state = Arc::new(AppState {
+        cache,
+        env_explain: None,
+        langfuse_host: None,
+        focus_trace: Some("t-focus-123".into()),
+    });
+    let app = router_with_state(state);
+
+    let resp = app.oneshot(get("/api/config")).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(data["focusTrace"], "t-focus-123");
+}
+
+#[tokio::test]
+async fn config_omits_null_fields() {
+    let (app, _mock) = setup().await;
+    let resp = app.oneshot(get("/api/config")).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(data["explain"], false);
+    assert!(data.get("langfuseHost").is_none() || data["langfuseHost"].is_null());
+    assert!(data.get("focusTrace").is_none() || data["focusTrace"].is_null());
+}
+
+// --- GET /api/sessions ---
+
+#[tokio::test]
+async fn sessions_groups_traces_by_session_id() {
+    let (app, mock, cache) = setup_warmed().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/traces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                {
+                    "id": "t-1", "name": "step-1", "sessionId": "sess-a",
+                    "timestamp": "2026-06-14T10:00:00.000Z", "latency": 1.0, "totalCost": 0.01
+                },
+                {
+                    "id": "t-2", "name": "step-2", "sessionId": "sess-a",
+                    "timestamp": "2026-06-14T10:01:00.000Z", "latency": 2.0, "totalCost": 0.02
+                },
+                {
+                    "id": "t-3", "name": "solo", "sessionId": "sess-b",
+                    "timestamp": "2026-06-14T11:00:00.000Z", "latency": 0.5, "totalCost": 0.005
+                },
+                {
+                    "id": "t-4", "name": "no-session",
+                    "timestamp": "2026-06-14T12:00:00.000Z"
+                }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    cache.warm().await.unwrap();
+
+    let resp = app.oneshot(get("/api/sessions")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(sessions.len(), 2);
+
+    let sess_a = sessions
+        .iter()
+        .find(|s| s["sessionId"] == "sess-a")
+        .unwrap();
+    assert_eq!(sess_a["traceCount"], 2);
+    assert_eq!(sess_a["totalCost"], 0.03);
+
+    let sess_b = sessions
+        .iter()
+        .find(|s| s["sessionId"] == "sess-b")
+        .unwrap();
+    assert_eq!(sess_b["traceCount"], 1);
+}
+
+#[tokio::test]
+async fn sessions_returns_empty_when_no_sessions() {
+    let (app, mock, cache) = setup_warmed().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/traces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                { "id": "t-1", "name": "no-session", "timestamp": "2026-06-14T10:00:00.000Z" }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    cache.warm().await.unwrap();
+
+    let resp = app.oneshot(get("/api/sessions")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert!(sessions.is_empty());
 }
 
 // --- POST /api/refresh ---

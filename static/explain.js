@@ -77,7 +77,7 @@
     var picker = el('div', 'explain-picker');
 
     var title = el('div', 'picker-title', 'Which do you use?');
-    var subtitle = el('div', 'picker-subtitle', 'Any model works — pick whatever you have.');
+    var subtitle = el('div', 'picker-subtitle', 'Any model works, pick whatever you have.');
     picker.appendChild(title);
     picker.appendChild(subtitle);
 

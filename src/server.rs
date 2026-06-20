@@ -6,7 +6,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use rust_embed::Embed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::cache::TraceCache;
 use crate::explain::ExplainClient;
@@ -18,10 +19,17 @@ struct Assets;
 pub struct AppState {
     pub cache: Arc<TraceCache>,
     pub env_explain: Option<ExplainClient>,
+    pub langfuse_host: Option<String>,
+    pub focus_trace: Option<String>,
 }
 
 pub fn router(cache: Arc<TraceCache>, env_explain: Option<ExplainClient>) -> Router {
-    let state = Arc::new(AppState { cache, env_explain });
+    let state = Arc::new(AppState {
+        cache,
+        env_explain,
+        langfuse_host: None,
+        focus_trace: None,
+    });
     router_with_state(state)
 }
 
@@ -30,6 +38,7 @@ pub fn router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/traces", get(list_traces))
         .route("/api/traces/{trace_id}", get(get_trace))
         .route("/api/traces/{trace_id}/explain", post(explain_trace))
+        .route("/api/sessions", get(list_sessions))
         .route("/api/config", get(config))
         .route("/api/refresh", post(refresh))
         .with_state(state)
@@ -54,11 +63,65 @@ async fn get_trace(State(state): State<Arc<AppState>>, Path(trace_id): Path<Stri
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSummary {
+    session_id: String,
+    trace_count: usize,
+    first_trace: String,
+    last_trace: String,
+    total_cost: f64,
+    traces: Vec<String>,
+}
+
+async fn list_sessions(State(state): State<Arc<AppState>>) -> Response {
+    let traces = state.cache.traces().await;
+    let mut groups: HashMap<String, Vec<&crate::model::Trace>> = HashMap::new();
+
+    for trace in &traces {
+        if let Some(sid) = &trace.session_id {
+            groups.entry(sid.clone()).or_default().push(trace);
+        }
+    }
+
+    let mut sessions: Vec<SessionSummary> = groups
+        .into_iter()
+        .map(|(session_id, mut group)| {
+            group.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            let total_cost = group.iter().filter_map(|t| t.total_cost).sum();
+            let trace_ids: Vec<String> = group.iter().map(|t| t.id.clone()).collect();
+            SessionSummary {
+                session_id,
+                trace_count: group.len(),
+                first_trace: group
+                    .first()
+                    .map(|t| t.timestamp.clone())
+                    .unwrap_or_default(),
+                last_trace: group
+                    .last()
+                    .map(|t| t.timestamp.clone())
+                    .unwrap_or_default(),
+                total_cost,
+                traces: trace_ids,
+            }
+        })
+        .collect();
+
+    sessions.sort_by(|a, b| b.last_trace.cmp(&a.last_trace));
+    axum::Json(sessions).into_response()
+}
+
 async fn config(State(state): State<Arc<AppState>>) -> Response {
-    axum::Json(serde_json::json!({
+    let mut cfg = serde_json::json!({
         "explain": state.env_explain.is_some(),
-    }))
-    .into_response()
+    });
+    if let Some(host) = &state.langfuse_host {
+        cfg["langfuseHost"] = serde_json::json!(host);
+    }
+    if let Some(trace_id) = &state.focus_trace {
+        cfg["focusTrace"] = serde_json::json!(trace_id);
+    }
+    axum::Json(cfg).into_response()
 }
 
 #[derive(Deserialize)]
@@ -92,7 +155,7 @@ async fn explain_trace(
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({
-                "error": "no LLM configured — provide api_key in request or set OPENAI_API_KEY"
+                "error": "no LLM configured - provide api_key in request or set OPENAI_API_KEY"
             })),
         )
             .into_response();

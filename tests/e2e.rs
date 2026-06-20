@@ -287,3 +287,69 @@ async fn config_endpoint_returns_explain_status() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["explain"], false);
 }
+
+#[tokio::test]
+async fn sessions_endpoint_groups_by_session() {
+    let (base, mock, cache) = start_server().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/traces"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                {
+                    "id": "t-1", "name": "step-1", "sessionId": "sess-x",
+                    "timestamp": "2026-06-14T10:00:00.000Z", "totalCost": 0.01
+                },
+                {
+                    "id": "t-2", "name": "step-2", "sessionId": "sess-x",
+                    "timestamp": "2026-06-14T10:01:00.000Z", "totalCost": 0.02
+                },
+                {
+                    "id": "t-3", "name": "solo",
+                    "timestamp": "2026-06-14T11:00:00.000Z"
+                }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    cache.warm().await.unwrap();
+
+    let http = reqwest::Client::new();
+    let resp = http
+        .get(format!("{base}/api/sessions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let sessions: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["sessionId"], "sess-x");
+    assert_eq!(sessions[0]["traceCount"], 2);
+    assert_eq!(sessions[0]["totalCost"], 0.03);
+}
+
+#[tokio::test]
+async fn config_with_langfuse_host() {
+    let mock = MockServer::start().await;
+    let client = langfuse::Client::with_base_url(mock.uri());
+    let cache = Arc::new(TraceCache::new(client));
+    let state = Arc::new(pistui::server::AppState {
+        cache,
+        env_explain: None,
+        langfuse_host: Some("https://cloud.langfuse.com".into()),
+        focus_trace: None,
+    });
+    let app = pistui::server::router_with_state(state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let http = reqwest::Client::new();
+    let resp = http.get(format!("{base}/api/config")).send().await.unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["langfuseHost"], "https://cloud.langfuse.com");
+}

@@ -154,7 +154,7 @@ pub enum Error {
     #[error("trace not found: {0}")]
     NotFound(String),
 
-    #[error("rate limited — try again shortly")]
+    #[error("rate limited - try again shortly")]
     RateLimit,
 
     #[error("explanation failed: {0}")]

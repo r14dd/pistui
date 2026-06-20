@@ -29,7 +29,13 @@ async fn main() -> Result<()> {
 
     let env_explain = build_env_explain();
 
-    let app = server::router(cache, env_explain);
+    let state = std::sync::Arc::new(pistui::server::AppState {
+        cache,
+        env_explain,
+        langfuse_host: Some(args.host.clone()),
+        focus_trace: args.trace.clone(),
+    });
+    let app = server::router_with_state(state);
 
     let addr = format!("127.0.0.1:{}", args.port);
     let listener = TcpListener::bind(&addr)

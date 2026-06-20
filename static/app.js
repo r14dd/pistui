@@ -6,16 +6,39 @@
   var sortAsc = false;
   var filterText = '';
   var selectedIdx = -1;
+  var appConfig = {};
+  var viewMode = 'traces';
 
   window.addEventListener('hashchange', route);
-  document.addEventListener('DOMContentLoaded', route);
+  document.addEventListener('DOMContentLoaded', init);
+
+  async function init() {
+    try {
+      var resp = await fetch('/api/config');
+      if (resp.ok) appConfig = await resp.json();
+    } catch (e) { /* proceed without config */ }
+
+    window.appConfig = appConfig;
+
+    if (appConfig.focusTrace) {
+      location.hash = '#/traces/' + encodeURIComponent(appConfig.focusTrace);
+      return;
+    }
+    route();
+  }
 
   function route() {
     var hash = location.hash || '#/';
     var match = hash.match(/^#\/traces\/(.+)$/);
-    if (match) {
+    var compareMatch = hash.match(/^#\/compare\/([^/]+)\/(.+)$/);
+    if (compareMatch) {
+      selectedIdx = -1;
+      showCompare(decodeURIComponent(compareMatch[1]), decodeURIComponent(compareMatch[2]));
+    } else if (match) {
       selectedIdx = -1;
       showTrace(decodeURIComponent(match[1]));
+    } else if (hash === '#/sessions') {
+      showSessions();
     } else {
       showList();
     }
@@ -23,6 +46,9 @@
 
   async function showList() {
     var app = document.getElementById('app');
+    viewMode = 'traces';
+    app.innerHTML = '';
+    app.appendChild(buildSkeleton());
 
     try {
       var resp = await fetch('/api/traces');
@@ -35,6 +61,101 @@
     } catch (e) {
       app.innerHTML = '<div class="error-msg">failed to load traces: ' + esc(e.message) + '</div>';
     }
+  }
+
+  async function showSessions() {
+    var app = document.getElementById('app');
+    viewMode = 'sessions';
+    app.innerHTML = '';
+    app.appendChild(buildSkeleton());
+
+    try {
+      var resp = await fetch('/api/sessions');
+      if (!resp.ok) throw new Error('failed to load sessions');
+      var sessions = await resp.json();
+      renderSessions(sessions);
+    } catch (e) {
+      app.innerHTML = '<div class="error-msg">' + esc(e.message) + '</div>';
+    }
+  }
+
+  function renderSessions(sessions) {
+    var app = document.getElementById('app');
+    app.innerHTML = '';
+
+    var bar = el('div', 'filter-bar');
+    var viewToggle = buildViewToggle();
+    bar.appendChild(viewToggle);
+    var refreshBtn = el('button', 'btn refresh-btn', '↻ refresh');
+    refreshBtn.addEventListener('click', function () { showSessions(); });
+    bar.appendChild(refreshBtn);
+    app.appendChild(bar);
+
+    if (sessions.length === 0) {
+      var empty = el('div', 'empty-state');
+      empty.textContent = 'no sessions found - traces without a session_id are not grouped';
+      app.appendChild(empty);
+      return;
+    }
+
+    var list = el('div', 'session-list');
+    sessions.forEach(function (sess) {
+      var card = el('div', 'session-card');
+
+      var header = el('div', 'session-header');
+      var name = el('span', 'session-name', sess.sessionId);
+      header.appendChild(name);
+
+      var meta = el('span', 'session-meta');
+      meta.textContent = sess.traceCount + ' trace' + (sess.traceCount !== 1 ? 's' : '') +
+        (sess.totalCost > 0 ? ' · ' + fmtCost(sess.totalCost) : '');
+      header.appendChild(meta);
+
+      card.appendChild(header);
+
+      var traceList = el('div', 'session-traces collapsed');
+      sess.traces.forEach(function (traceId) {
+        var row = el('div', 'session-trace-row');
+        var link = el('a', 'session-trace-link', traceId.slice(0, 20));
+        link.href = '#/traces/' + encodeURIComponent(traceId);
+        row.appendChild(link);
+        traceList.appendChild(row);
+      });
+      card.appendChild(traceList);
+
+      header.addEventListener('click', function () {
+        traceList.classList.toggle('collapsed');
+        card.classList.toggle('expanded');
+      });
+
+      list.appendChild(card);
+    });
+
+    app.appendChild(list);
+  }
+
+  function buildSkeleton() {
+    var skel = el('div', 'skeleton');
+    for (var i = 0; i < 8; i++) {
+      var row = el('div', 'skeleton-row');
+      row.appendChild(el('div', 'skeleton-cell wide'));
+      row.appendChild(el('div', 'skeleton-cell narrow'));
+      row.appendChild(el('div', 'skeleton-cell medium'));
+      row.appendChild(el('div', 'skeleton-cell narrow'));
+      skel.appendChild(row);
+    }
+    return skel;
+  }
+
+  function buildViewToggle() {
+    var toggle = el('div', 'view-toggle');
+    var tracesBtn = el('button', 'view-btn' + (viewMode === 'traces' ? ' active' : ''), 'traces');
+    tracesBtn.addEventListener('click', function () { location.hash = '#/'; });
+    var sessionsBtn = el('button', 'view-btn' + (viewMode === 'sessions' ? ' active' : ''), 'sessions');
+    sessionsBtn.addEventListener('click', function () { location.hash = '#/sessions'; });
+    toggle.appendChild(tracesBtn);
+    toggle.appendChild(sessionsBtn);
+    return toggle;
   }
 
   function renderList() {
@@ -62,6 +183,9 @@
     app.innerHTML = '';
 
     var bar = el('div', 'filter-bar');
+    var viewToggle = buildViewToggle();
+    bar.appendChild(viewToggle);
+
     var input = el('input', 'filter-input');
     input.type = 'text';
     input.placeholder = 'filter traces…  (/ to focus)';
@@ -73,6 +197,21 @@
     });
     bar.appendChild(input);
 
+    var compareBtn = el('button', 'btn compare-btn',
+      compareSelection.length > 0 ? 'cancel compare (' + compareSelection.length + '/2)' : 'compare');
+    compareBtn.title = 'Select two traces to compare side-by-side';
+    compareBtn.addEventListener('click', function () {
+      if (compareSelection.length > 0) {
+        compareSelection = [];
+        renderList();
+      } else {
+        compareSelection = [];
+        renderList();
+        compareBtn.textContent = 'cancel compare (0/2)';
+      }
+    });
+    bar.appendChild(compareBtn);
+
     var refreshBtn = el('button', 'btn refresh-btn', '↻ refresh');
     refreshBtn.title = 'Fetch latest traces from Langfuse (R)';
     refreshBtn.addEventListener('click', doRefresh);
@@ -81,7 +220,22 @@
     app.appendChild(bar);
 
     if (sorted.length === 0) {
-      app.appendChild(el('div', 'empty-state', filterText ? 'no matching traces' : 'no traces found'));
+      var empty = el('div', 'empty-state');
+      if (filterText) {
+        empty.textContent = 'no traces match "' + filterText + '"';
+        var clearLink = el('span', 'empty-action', ' - clear filter');
+        clearLink.addEventListener('click', function () {
+          filterText = '';
+          selectedIdx = -1;
+          renderList();
+        });
+        empty.appendChild(clearLink);
+      } else {
+        empty.textContent = 'no traces yet';
+        var refreshLink = el('span', 'empty-action', ' - press R to refresh');
+        empty.appendChild(refreshLink);
+      }
+      app.appendChild(empty);
       return;
     }
 
@@ -125,8 +279,21 @@
       var row = el('tr');
       row.dataset.idx = idx;
       if (idx === selectedIdx) row.classList.add('selected');
+      if (compareSelection.indexOf(t.id) !== -1) row.classList.add('compare-selected');
 
       row.addEventListener('click', function () {
+        if (compareSelection.length > 0 && compareSelection.length < 2) {
+          if (compareSelection.indexOf(t.id) === -1) {
+            compareSelection.push(t.id);
+            if (compareSelection.length === 2) {
+              location.hash = '#/compare/' + encodeURIComponent(compareSelection[0]) + '/' + encodeURIComponent(compareSelection[1]);
+              compareSelection = [];
+            } else {
+              renderList();
+            }
+            return;
+          }
+        }
         location.hash = '#/traces/' + encodeURIComponent(t.id);
       });
 
@@ -135,11 +302,11 @@
       row.appendChild(td(document.createTextNode(fmtTime(t.timestamp))));
 
       var dur = el('span', 'duration');
-      dur.textContent = t.latency != null ? fmtDuration(t.latency * 1000) : '—';
+      dur.textContent = t.latency != null ? fmtDuration(t.latency * 1000) : '-';
       row.appendChild(td(dur));
 
       var cost = el('span', 'cost');
-      cost.textContent = t.totalCost != null ? fmtCost(t.totalCost) : '—';
+      cost.textContent = t.totalCost != null ? fmtCost(t.totalCost) : '-';
       row.appendChild(td(cost));
 
       var tagsCell = el('td');
@@ -226,6 +393,127 @@
     }
   }
 
+  // --- compare mode ---
+
+  var compareSelection = [];
+
+  function toggleCompareMode() {
+    compareSelection = [];
+    renderList();
+  }
+
+  async function showCompare(idA, idB) {
+    var app = document.getElementById('app');
+    app.innerHTML = '';
+
+    var hdr = el('div', 'detail-header');
+    var back = el('a', 'back-link', '← traces');
+    back.href = '#/';
+    hdr.appendChild(back);
+    hdr.appendChild(el('h2', null, 'compare traces'));
+    app.appendChild(hdr);
+
+    var grid = el('div', 'compare-grid');
+
+    var colA = el('div', 'compare-col');
+    colA.innerHTML = '<div class="loading">loading…</div>';
+    grid.appendChild(colA);
+
+    var colB = el('div', 'compare-col');
+    colB.innerHTML = '<div class="loading">loading…</div>';
+    grid.appendChild(colB);
+
+    app.appendChild(grid);
+
+    var dataA, dataB;
+    try {
+      var [respA, respB] = await Promise.all([
+        fetch('/api/traces/' + encodeURIComponent(idA)),
+        fetch('/api/traces/' + encodeURIComponent(idB)),
+      ]);
+      if (!respA.ok || !respB.ok) throw new Error('failed to fetch traces');
+      dataA = await respA.json();
+      dataB = await respB.json();
+    } catch (e) {
+      app.innerHTML = '<div class="error-msg">' + esc(e.message) + '</div>';
+      return;
+    }
+
+    colA.innerHTML = '';
+    colB.innerHTML = '';
+
+    renderCompareCol(colA, dataA);
+    renderCompareCol(colB, dataB);
+
+    var diffBar = buildStatsDiff(dataA.stats, dataB.stats);
+    grid.insertBefore(diffBar, grid.firstChild);
+  }
+
+  function renderCompareCol(col, data) {
+    col.appendChild(el('h3', 'compare-title', data.trace.name || data.trace.id));
+    col.appendChild(renderMiniStats(data.stats));
+
+    var treeContainer = el('div', 'tree-container');
+    var totalMs = data.stats.totalDurationMs;
+    var traceStart = findTreeStart(data.tree);
+    data.tree.forEach(function (node) {
+      treeContainer.appendChild(window.renderSingleNode(node, 0, totalMs, traceStart));
+    });
+    col.appendChild(treeContainer);
+  }
+
+  function renderMiniStats(stats) {
+    var bar = el('div', 'stats-bar compact');
+    miniStat(bar, 'Duration', stats.totalDurationMs != null ? fmtDuration(stats.totalDurationMs) : '-');
+    miniStat(bar, 'Tokens', (stats.totalTokensIn + stats.totalTokensOut).toLocaleString());
+    miniStat(bar, 'Cost', fmtCost(stats.totalCost));
+    if (stats.errorCount > 0) miniStat(bar, 'Errors', stats.errorCount, 'stat-errors');
+    return bar;
+  }
+
+  function miniStat(bar, label, value, cls) {
+    var item = el('div', 'stat-item' + (cls ? ' ' + cls : ''));
+    item.appendChild(el('span', 'stat-label', label));
+    item.appendChild(el('span', 'stat-value', String(value)));
+    bar.appendChild(item);
+  }
+
+  function buildStatsDiff(a, b) {
+    var bar = el('div', 'compare-diff');
+    diffItem(bar, 'Duration', a.totalDurationMs, b.totalDurationMs, fmtDuration);
+    diffItem(bar, 'Tokens in', a.totalTokensIn, b.totalTokensIn);
+    diffItem(bar, 'Tokens out', a.totalTokensOut, b.totalTokensOut);
+    diffItem(bar, 'Cost', a.totalCost, b.totalCost, fmtCost);
+    diffItem(bar, 'Errors', a.errorCount, b.errorCount);
+    return bar;
+  }
+
+  function diffItem(bar, label, valA, valB, fmt) {
+    var item = el('div', 'diff-item');
+    item.appendChild(el('span', 'diff-label', label));
+    var a = fmt ? fmt(valA || 0) : String(valA || 0);
+    var b = fmt ? fmt(valB || 0) : String(valB || 0);
+    var diff = (valB || 0) - (valA || 0);
+    var diffStr = diff === 0 ? '=' : (diff > 0 ? '+' : '') + (fmt ? fmt(Math.abs(diff)) : String(diff));
+    var diffCls = diff === 0 ? 'diff-neutral' : (diff > 0 ? 'diff-up' : 'diff-down');
+    item.appendChild(el('span', 'diff-val', a + ' → ' + b));
+    item.appendChild(el('span', 'diff-delta ' + diffCls, diffStr));
+    bar.appendChild(item);
+  }
+
+  function findTreeStart(tree) {
+    var min = Infinity;
+    function walk(nodes) {
+      for (var i = 0; i < nodes.length; i++) {
+        var t = new Date(nodes[i].startTime).getTime();
+        if (t < min) min = t;
+        walk(nodes[i].children);
+      }
+    }
+    walk(tree);
+    return min;
+  }
+
   // --- keyboard shortcuts ---
 
   document.addEventListener('keydown', function (e) {
@@ -283,7 +571,7 @@
   }
 
   function fmtTime(iso) {
-    if (!iso) return '—';
+    if (!iso) return '-';
     var d = new Date(iso);
     return d.toLocaleString(undefined, {
       month: 'short', day: 'numeric',
@@ -300,7 +588,7 @@
   };
 
   window.fmtCost = function (cost) {
-    if (cost == null) return '—';
+    if (cost == null) return '-';
     if (cost < 0.001) return '<$0.001';
     if (cost < 1) return '$' + cost.toFixed(4);
     return '$' + cost.toFixed(2);

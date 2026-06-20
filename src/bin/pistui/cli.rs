@@ -26,4 +26,8 @@ pub struct Args {
     /// Don't open the browser automatically
     #[arg(long)]
     pub no_open: bool,
+
+    /// Focus on a single trace by ID
+    #[arg()]
+    pub trace: Option<String>,
 }
