@@ -255,6 +255,7 @@ mod tests {
             event_count: 1,
             error_count: 1,
             deepest_nesting: 2,
+            model_breakdown: Vec::new(),
         }
     }
 

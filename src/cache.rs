@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 
 use crate::langfuse;
-use crate::model::{Result, SpanNode, Trace, TraceStats};
+use crate::model::{Result, Score, SpanNode, Trace, TraceStats};
 use crate::parser;
 
 struct CacheState {
@@ -16,6 +16,7 @@ struct CachedDetail {
     trace: Trace,
     tree: Vec<SpanNode>,
     stats: TraceStats,
+    scores: Vec<Score>,
 }
 
 pub struct TraceCache {
@@ -56,22 +57,34 @@ impl TraceCache {
         self.state.read().await.traces.clone()
     }
 
-    pub async fn trace_detail(&self, trace_id: &str) -> Result<(Trace, Vec<SpanNode>, TraceStats)> {
+    pub async fn trace_detail(
+        &self,
+        trace_id: &str,
+    ) -> Result<(Trace, Vec<SpanNode>, TraceStats, Vec<Score>)> {
         {
             let state = self.state.read().await;
             if let Some(d) = state.details.get(trace_id) {
-                return Ok((d.trace.clone(), d.tree.clone(), d.stats.clone()));
+                return Ok((
+                    d.trace.clone(),
+                    d.tree.clone(),
+                    d.stats.clone(),
+                    d.scores.clone(),
+                ));
             }
         }
 
         let trace = self.client.get_trace(trace_id).await?;
-        let observations = self.client.get_observations(trace_id).await?;
+        let (observations, scores) = tokio::try_join!(
+            self.client.get_observations(trace_id),
+            self.client.get_scores(trace_id),
+        )?;
         let (tree, stats) = parser::build_tree(&observations);
 
         let detail = CachedDetail {
             trace: trace.clone(),
             tree: tree.clone(),
             stats: stats.clone(),
+            scores: scores.clone(),
         };
         self.state
             .write()
@@ -79,7 +92,7 @@ impl TraceCache {
             .details
             .insert(trace_id.to_string(), detail);
 
-        Ok((trace, tree, stats))
+        Ok((trace, tree, stats, scores))
     }
 
     pub async fn refresh(&self) -> Result<()> {
@@ -160,6 +173,21 @@ mod tests {
         assert_eq!(second.len(), 1);
     }
 
+    fn scores_json(scores: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "data": scores })
+    }
+
+    async fn mount_scores_empty(mock: &MockServer, trace_id: &str) {
+        Mock::given(method("GET"))
+            .and(path("/api/public/scores"))
+            .and(query_param("traceid", trace_id))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(scores_json(serde_json::json!([]))),
+            )
+            .mount(mock)
+            .await;
+    }
+
     #[tokio::test]
     async fn trace_detail_fetches_on_miss() {
         let (cache, mock) = setup().await;
@@ -190,11 +218,54 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let (trace, tree, stats) = cache.trace_detail("t-1").await.unwrap();
+        mount_scores_empty(&mock, "t-1").await;
+
+        let (trace, tree, stats, _scores) = cache.trace_detail("t-1").await.unwrap();
         assert_eq!(trace.name.as_deref(), Some("my-trace"));
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].name, "root");
         assert_eq!(stats.span_count, 1);
+    }
+
+    #[tokio::test]
+    async fn trace_detail_includes_scores() {
+        let (cache, mock) = setup().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/traces/t-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "t-1", "timestamp": "2026-06-14T10:00:00.000Z"
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/observations"))
+            .and(query_param("traceId", "t-1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(observations_json(serde_json::json!([]))),
+            )
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/scores"))
+            .and(query_param("traceid", "t-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(scores_json(
+                serde_json::json!([
+                    {
+                        "id": "s-1", "traceId": "t-1", "name": "accuracy",
+                        "value": 0.95, "source": "API"
+                    }
+                ]),
+            )))
+            .mount(&mock)
+            .await;
+
+        let (_trace, _tree, _stats, scores) = cache.trace_detail("t-1").await.unwrap();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].name, "accuracy");
+        assert_eq!(scores[0].value, Some(0.95));
     }
 
     #[tokio::test]
@@ -206,7 +277,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "t-1", "timestamp": "2026-06-14T10:00:00.000Z"
             })))
-            .expect(1) // exactly one fetch
+            .expect(1)
             .mount(&mock)
             .await;
 
@@ -216,12 +287,14 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(observations_json(serde_json::json!([]))),
             )
-            .expect(1) // exactly one fetch
+            .expect(1)
             .mount(&mock)
             .await;
 
+        mount_scores_empty(&mock, "t-1").await;
+
         cache.trace_detail("t-1").await.unwrap();
-        let (_, tree, _) = cache.trace_detail("t-1").await.unwrap();
+        let (_, tree, _, _) = cache.trace_detail("t-1").await.unwrap();
         assert!(tree.is_empty());
     }
 
@@ -287,12 +360,11 @@ mod tests {
             .mount(&mock)
             .await;
 
+        mount_scores_empty(&mock, "t-1").await;
+
         cache.trace_detail("t-1").await.unwrap();
         cache.refresh().await.unwrap();
 
-        // after refresh, detail should be re-fetched (not from stale cache)
-        // the mock is still mounted, so it will serve the same data
-        // but the point is: the cache was cleared, forcing a new fetch
         let received = mock.received_requests().await.unwrap();
         let detail_calls = received
             .iter()
@@ -300,7 +372,6 @@ mod tests {
             .count();
         assert_eq!(detail_calls, 1);
 
-        // now fetching again should hit Langfuse again
         cache.trace_detail("t-1").await.unwrap();
         let received = mock.received_requests().await.unwrap();
         let detail_calls = received

@@ -134,6 +134,38 @@ pub struct TraceStats {
     pub event_count: usize,
     pub error_count: usize,
     pub deepest_nesting: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_breakdown: Vec<ModelStats>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStats {
+    pub model: String,
+    pub count: usize,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Score {
+    pub id: String,
+    pub trace_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub value: Option<f64>,
+    #[serde(default)]
+    pub string_value: Option<String>,
+    #[serde(default)]
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub observation_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub data_type: Option<String>,
 }
 
 // --- Errors ---
@@ -195,6 +227,37 @@ mod tests {
             serde_json::from_str::<SpanKind>(r#""EVENT""#).unwrap(),
             SpanKind::Event
         );
+    }
+
+    #[test]
+    fn score_deserializes_from_langfuse_response() {
+        let json = r#"{
+            "id": "s-1",
+            "traceId": "t-1",
+            "name": "user-feedback",
+            "value": 1.0,
+            "comment": "great",
+            "source": "API"
+        }"#;
+        let score: Score = serde_json::from_str(json).unwrap();
+        assert_eq!(score.id, "s-1");
+        assert_eq!(score.name, "user-feedback");
+        assert_eq!(score.value, Some(1.0));
+        assert_eq!(score.comment.as_deref(), Some("great"));
+    }
+
+    #[test]
+    fn score_deserializes_string_value() {
+        let json = r#"{
+            "id": "s-2",
+            "traceId": "t-1",
+            "name": "category",
+            "stringValue": "positive",
+            "dataType": "CATEGORICAL"
+        }"#;
+        let score: Score = serde_json::from_str(json).unwrap();
+        assert_eq!(score.string_value.as_deref(), Some("positive"));
+        assert_eq!(score.data_type.as_deref(), Some("CATEGORICAL"));
     }
 
     #[test]

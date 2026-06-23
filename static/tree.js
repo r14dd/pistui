@@ -33,10 +33,26 @@
       headerActions.appendChild(lfLink);
     }
 
+    var exportBtn = el('a', 'btn btn-sm', 'export JSON');
+    exportBtn.href = '/api/traces/' + encodeURIComponent(data.trace.id) + '/export';
+    exportBtn.download = 'pistui-' + data.trace.id + '.json';
+    headerActions.appendChild(exportBtn);
+
     hdr.appendChild(headerActions);
     container.appendChild(hdr);
 
+    var meta = renderMetadata(data.trace);
+    if (meta) container.appendChild(meta);
+
     container.appendChild(renderStats(data.stats));
+
+    if (data.stats.modelBreakdown && data.stats.modelBreakdown.length > 0) {
+      container.appendChild(renderModelBreakdown(data.stats.modelBreakdown));
+    }
+
+    if (data.scores && data.scores.length > 0) {
+      container.appendChild(renderScores(data.scores));
+    }
 
     if (window.renderExplainButton) {
       window.renderExplainButton(container, data.trace.id);
@@ -338,6 +354,76 @@
       content.style.display = 'block';
     });
     tabs.appendChild(tab);
+  }
+
+  function renderMetadata(trace) {
+    var items = [];
+    if (trace.userId) items.push(['User', trace.userId]);
+    if (trace.sessionId) items.push(['Session', trace.sessionId]);
+    if (trace.release) items.push(['Release', trace.release]);
+    if (trace.timestamp) items.push(['Timestamp', new Date(trace.timestamp).toLocaleString()]);
+    if (items.length === 0) return null;
+
+    var bar = el('div', 'metadata-bar');
+    items.forEach(function (pair) {
+      var item = el('div', 'meta-item');
+      item.appendChild(el('span', 'meta-label', pair[0]));
+      item.appendChild(el('span', 'meta-value', pair[1]));
+      bar.appendChild(item);
+    });
+    return bar;
+  }
+
+  function renderModelBreakdown(breakdown) {
+    var section = el('div', 'model-breakdown');
+    var heading = el('div', 'breakdown-heading', 'Models');
+    section.appendChild(heading);
+
+    var table = el('table', 'breakdown-table');
+    var thead = el('thead');
+    var headRow = el('tr');
+    ['Model', 'Calls', 'Tokens in', 'Tokens out', 'Cost'].forEach(function (h) {
+      headRow.appendChild(el('th', null, h));
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = el('tbody');
+    breakdown.forEach(function (m) {
+      var row = el('tr');
+      row.appendChild(el('td', 'model-name', m.model));
+      row.appendChild(el('td', null, String(m.count)));
+      row.appendChild(el('td', null, m.tokensIn.toLocaleString()));
+      row.appendChild(el('td', null, m.tokensOut.toLocaleString()));
+      row.appendChild(el('td', null, fmtCost(m.cost)));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    section.appendChild(table);
+    return section;
+  }
+
+  function renderScores(scores) {
+    var section = el('div', 'scores-section');
+    var heading = el('div', 'scores-heading', 'Scores');
+    section.appendChild(heading);
+
+    var list = el('div', 'scores-list');
+    scores.forEach(function (s) {
+      var item = el('div', 'score-item');
+      item.appendChild(el('span', 'score-name', s.name));
+      var val = s.value != null ? String(s.value) : (s.stringValue || '-');
+      item.appendChild(el('span', 'score-value', val));
+      if (s.comment) {
+        item.appendChild(el('span', 'score-comment', s.comment));
+      }
+      if (s.source) {
+        item.appendChild(el('span', 'score-source', s.source));
+      }
+      list.appendChild(item);
+    });
+    section.appendChild(list);
+    return section;
   }
 
   window.renderSingleNode = renderNode;

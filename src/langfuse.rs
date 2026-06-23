@@ -2,7 +2,7 @@ use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use std::time::Duration;
 
-use crate::model::{Error, Observation, Result, Trace};
+use crate::model::{Error, Observation, Result, Score, Trace};
 
 pub struct Client {
     http: reqwest::Client,
@@ -87,6 +87,17 @@ impl Client {
             page += 1;
         }
         Ok(all)
+    }
+    pub async fn get_scores(&self, trace_id: &str) -> Result<Vec<Score>> {
+        let url = format!(
+            "{}/api/public/scores?traceid={trace_id}&limit=100",
+            self.base_url
+        );
+        let resp = self.http.get(&url).send().await?;
+        let resp = map_status(resp).await?;
+        let paged: PagedResponse<Score> =
+            resp.json().await.map_err(|e| Error::Parse(e.to_string()))?;
+        Ok(paged.data)
     }
 }
 
@@ -231,6 +242,45 @@ mod tests {
         let client = Client::with_base_url(server.uri());
         let err = client.list_traces(50, 1).await.unwrap_err();
         assert!(matches!(err, Error::RateLimit));
+    }
+
+    #[tokio::test]
+    async fn get_scores_parses_response() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "data": [
+                {
+                    "id": "s-1",
+                    "traceId": "trace-1",
+                    "name": "accuracy",
+                    "value": 0.95,
+                    "source": "API"
+                },
+                {
+                    "id": "s-2",
+                    "traceId": "trace-1",
+                    "name": "sentiment",
+                    "stringValue": "positive",
+                    "dataType": "CATEGORICAL"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/scores"))
+            .and(query_param("traceid", "trace-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri());
+        let scores = client.get_scores("trace-1").await.unwrap();
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0].name, "accuracy");
+        assert_eq!(scores[0].value, Some(0.95));
+        assert_eq!(scores[1].name, "sentiment");
+        assert_eq!(scores[1].string_value.as_deref(), Some("positive"));
     }
 
     #[tokio::test]

@@ -106,6 +106,13 @@ async fn full_flow_list_then_detail() {
         .mount(&mock)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/api/public/scores"))
+        .and(query_param("traceid", "t-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&mock)
+        .await;
+
     cache.warm().await.unwrap();
 
     let http = reqwest::Client::new();

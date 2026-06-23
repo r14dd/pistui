@@ -213,6 +213,13 @@ async fn get_trace_returns_tree_and_stats() {
         .mount(&mock)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/api/public/scores"))
+        .and(query_param("traceid", "t-abc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&mock)
+        .await;
+
     let resp = app.oneshot(get("/api/traces/t-abc")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -272,6 +279,13 @@ async fn get_trace_with_no_observations() {
         .mount(&mock)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/api/public/scores"))
+        .and(query_param("traceid", "t-empty"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&mock)
+        .await;
+
     let resp = app.oneshot(get("/api/traces/t-empty")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -281,6 +295,193 @@ async fn get_trace_with_no_observations() {
     let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(data["tree"].as_array().unwrap().is_empty());
     assert_eq!(data["stats"]["spanCount"], 0);
+}
+
+// --- GET /api/traces/{id}/export ---
+
+#[tokio::test]
+async fn export_returns_json_attachment() {
+    let (app, mock) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/traces/t-exp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "t-exp", "name": "export-me", "timestamp": "2026-06-14T10:00:00.000Z"
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/observations"))
+        .and(query_param("traceId", "t-exp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/scores"))
+        .and(query_param("traceid", "t-exp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&mock)
+        .await;
+
+    let resp = app.oneshot(get("/api/traces/t-exp/export")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let cd = resp
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(cd.contains("pistui-t-exp.json"));
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(data["trace"]["id"], "t-exp");
+}
+
+// --- scores in trace detail ---
+
+#[tokio::test]
+async fn trace_detail_includes_scores() {
+    let (app, mock) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/traces/t-scored"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "t-scored", "timestamp": "2026-06-14T10:00:00.000Z"
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/observations"))
+        .and(query_param("traceId", "t-scored"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/scores"))
+        .and(query_param("traceid", "t-scored"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                { "id": "s-1", "traceId": "t-scored", "name": "accuracy", "value": 0.9 },
+                { "id": "s-2", "traceId": "t-scored", "name": "helpfulness", "value": 4.0 }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    let resp = app.oneshot(get("/api/traces/t-scored")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let scores = data["scores"].as_array().unwrap();
+    assert_eq!(scores.len(), 2);
+    assert_eq!(scores[0]["name"], "accuracy");
+    assert_eq!(scores[0]["value"], 0.9);
+}
+
+#[tokio::test]
+async fn trace_detail_omits_scores_when_empty() {
+    let (app, mock) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/traces/t-no-scores"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "t-no-scores", "timestamp": "2026-06-14T10:00:00.000Z"
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/observations"))
+        .and(query_param("traceId", "t-no-scores"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/scores"))
+        .and(query_param("traceid", "t-no-scores"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&mock)
+        .await;
+
+    let resp = app.oneshot(get("/api/traces/t-no-scores")).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(data.get("scores").is_none());
+}
+
+// --- model breakdown in stats ---
+
+#[tokio::test]
+async fn trace_detail_includes_model_breakdown() {
+    let (app, mock) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/traces/t-models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "t-models", "timestamp": "2026-06-14T10:00:00.000Z"
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/observations"))
+        .and(query_param("traceId", "t-models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                {
+                    "id": "obs-1", "traceId": "t-models", "type": "GENERATION",
+                    "name": "call-1", "startTime": "2026-06-14T10:00:00.000Z",
+                    "endTime": "2026-06-14T10:00:01.000Z",
+                    "model": "gpt-4o",
+                    "usage": { "input": 100, "output": 50 },
+                    "calculatedTotalCost": 0.005
+                },
+                {
+                    "id": "obs-2", "traceId": "t-models", "type": "GENERATION",
+                    "name": "call-2", "startTime": "2026-06-14T10:00:01.000Z",
+                    "endTime": "2026-06-14T10:00:02.000Z",
+                    "model": "gpt-4o-mini",
+                    "usage": { "input": 200, "output": 100 },
+                    "calculatedTotalCost": 0.001
+                }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/scores"))
+        .and(query_param("traceid", "t-models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(&mock)
+        .await;
+
+    let resp = app.oneshot(get("/api/traces/t-models")).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let breakdown = data["stats"]["modelBreakdown"].as_array().unwrap();
+    assert_eq!(breakdown.len(), 2);
+
+    let gpt4o = breakdown.iter().find(|m| m["model"] == "gpt-4o").unwrap();
+    assert_eq!(gpt4o["count"], 1);
+    assert_eq!(gpt4o["tokensIn"], 100);
+    assert_eq!(gpt4o["cost"], 0.005);
 }
 
 // --- GET /api/config ---
@@ -337,6 +538,13 @@ async fn explain_with_request_key() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": []
         })))
+        .mount(&langfuse_mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/scores"))
+        .and(query_param("traceid", "t-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
         .mount(&langfuse_mock)
         .await;
 

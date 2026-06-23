@@ -37,6 +37,7 @@ pub fn router_with_state(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/traces", get(list_traces))
         .route("/api/traces/{trace_id}", get(get_trace))
+        .route("/api/traces/{trace_id}/export", get(export_trace))
         .route("/api/traces/{trace_id}/explain", post(explain_trace))
         .route("/api/sessions", get(list_sessions))
         .route("/api/config", get(config))
@@ -51,13 +52,47 @@ async fn list_traces(State(state): State<Arc<AppState>>) -> Response {
 
 async fn get_trace(State(state): State<Arc<AppState>>, Path(trace_id): Path<String>) -> Response {
     match state.cache.trace_detail(&trace_id).await {
-        Ok((trace, tree, stats)) => {
-            let body = serde_json::json!({
+        Ok((trace, tree, stats, scores)) => {
+            let mut body = serde_json::json!({
                 "trace": trace,
                 "tree": tree,
                 "stats": stats,
             });
+            if !scores.is_empty() {
+                body["scores"] = serde_json::json!(scores);
+            }
             axum::Json(body).into_response()
+        }
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn export_trace(
+    State(state): State<Arc<AppState>>,
+    Path(trace_id): Path<String>,
+) -> Response {
+    match state.cache.trace_detail(&trace_id).await {
+        Ok((trace, tree, stats, scores)) => {
+            let mut body = serde_json::json!({
+                "trace": trace,
+                "tree": tree,
+                "stats": stats,
+            });
+            if !scores.is_empty() {
+                body["scores"] = serde_json::json!(scores);
+            }
+            let filename = format!("pistui-{trace_id}.json");
+            (
+                [
+                    (header::CONTENT_TYPE, "application/json".to_string()),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{filename}\""),
+                    ),
+                ],
+                serde_json::to_string_pretty(&body).unwrap_or_default(),
+            )
+                .into_response()
         }
         Err(e) => error_response(&e),
     }
@@ -161,7 +196,7 @@ async fn explain_trace(
             .into_response();
     };
 
-    let (trace, tree, stats) = match state.cache.trace_detail(&trace_id).await {
+    let (trace, tree, stats, _scores) = match state.cache.trace_detail(&trace_id).await {
         Ok(d) => d,
         Err(e) => return error_response(&e),
     };

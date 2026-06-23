@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+- Scores: fetch and display Langfuse scores (numeric, categorical, with comments) on trace detail
+- Per-model token/cost breakdown table in trace stats
+- Trace metadata panel showing user ID, session ID, release, and timestamp
+- JSON export: download full trace data (tree, stats, scores) as a file
+- Keyboard shortcut help overlay (press `?`)
+- Auto-refresh API for polling new traces on an interval
+- Observations and scores fetched concurrently for faster trace detail loading
+
 ## 0.1.0
 
 Initial release.

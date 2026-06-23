@@ -514,11 +514,100 @@
     return min;
   }
 
+  // --- help overlay ---
+
+  function toggleHelp() {
+    var existing = document.querySelector('.help-overlay');
+    if (existing) { existing.remove(); return; }
+
+    var overlay = el('div', 'help-overlay');
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) overlay.remove();
+    });
+
+    var panel = el('div', 'help-panel');
+    panel.appendChild(el('h2', null, 'keyboard shortcuts'));
+
+    var sections = [
+      { title: 'trace list', keys: [
+        ['j / k', 'move down / up'],
+        ['Enter', 'open selected trace'],
+        ['/', 'focus filter input'],
+        ['R', 'refresh traces'],
+      ]},
+      { title: 'span tree', keys: [
+        ['j / k', 'move down / up'],
+        ['Enter', 'expand / collapse node'],
+        ['o', 'toggle input/output panel'],
+        ['Esc', 'back to trace list'],
+      ]},
+      { title: 'global', keys: [
+        ['?', 'toggle this help'],
+        ['/', 'focus filter input'],
+      ]},
+    ];
+
+    sections.forEach(function (s) {
+      panel.appendChild(el('h3', 'help-section-title', s.title));
+      var table = el('table', 'help-table');
+      s.keys.forEach(function (pair) {
+        var row = el('tr');
+        var keyCell = el('td', 'help-key');
+        keyCell.appendChild(el('kbd', 'kbd', pair[0]));
+        row.appendChild(keyCell);
+        row.appendChild(el('td', 'help-desc', pair[1]));
+        table.appendChild(row);
+      });
+      panel.appendChild(table);
+    });
+
+    var closeBtn = el('button', 'btn help-close', 'close');
+    closeBtn.addEventListener('click', function () { overlay.remove(); });
+    panel.appendChild(closeBtn);
+
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+  }
+
+  // --- auto-refresh ---
+
+  var autoRefreshTimer = null;
+
+  function startAutoRefresh(intervalMs) {
+    stopAutoRefresh();
+    autoRefreshTimer = setInterval(function () {
+      var onList = !location.hash || location.hash === '#/' || location.hash === '#';
+      if (onList) doRefresh();
+    }, intervalMs);
+  }
+
+  function stopAutoRefresh() {
+    if (autoRefreshTimer) {
+      clearInterval(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
+  }
+
+  window.startAutoRefresh = startAutoRefresh;
+  window.stopAutoRefresh = stopAutoRefresh;
+
   // --- keyboard shortcuts ---
 
   document.addEventListener('keydown', function (e) {
     if (e.target.tagName === 'INPUT') {
       if (e.key === 'Escape') { e.target.blur(); e.preventDefault(); }
+      return;
+    }
+
+    if (e.key === '?') {
+      e.preventDefault();
+      toggleHelp();
+      return;
+    }
+
+    var helpOpen = document.querySelector('.help-overlay');
+    if (helpOpen) {
+      if (e.key === 'Escape') { helpOpen.remove(); e.preventDefault(); }
       return;
     }
 

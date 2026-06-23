@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::model::{Observation, SpanKind, SpanNode, SpanStatus, TraceStats};
+use crate::model::{ModelStats, Observation, SpanKind, SpanNode, SpanStatus, TraceStats};
 
 pub fn build_tree(observations: &[Observation]) -> (Vec<SpanNode>, TraceStats) {
     let mut children_map: HashMap<Option<&str>, Vec<&Observation>> = HashMap::new();
@@ -79,7 +79,10 @@ fn compute_stats(roots: &[SpanNode], observations: &[Observation]) -> TraceStats
         event_count: 0,
         error_count: 0,
         deepest_nesting: 0,
+        model_breakdown: Vec::new(),
     };
+
+    let mut model_map: HashMap<String, (usize, u64, u64, f64)> = HashMap::new();
 
     for obs in observations {
         match obs.kind {
@@ -90,12 +93,37 @@ fn compute_stats(roots: &[SpanNode], observations: &[Observation]) -> TraceStats
         if obs.level.as_deref() == Some("ERROR") || obs.status_message.is_some() {
             stats.error_count += 1;
         }
-        if let Some(usage) = &obs.usage {
-            stats.total_tokens_in += usage.input.unwrap_or(0);
-            stats.total_tokens_out += usage.output.unwrap_or(0);
+        let tin = obs.usage.as_ref().and_then(|u| u.input).unwrap_or(0);
+        let tout = obs.usage.as_ref().and_then(|u| u.output).unwrap_or(0);
+        stats.total_tokens_in += tin;
+        stats.total_tokens_out += tout;
+        let cost = obs.calculated_total_cost.unwrap_or(0.0);
+        stats.total_cost += cost;
+
+        if let Some(model) = &obs.model {
+            let entry = model_map.entry(model.clone()).or_default();
+            entry.0 += 1;
+            entry.1 += tin;
+            entry.2 += tout;
+            entry.3 += cost;
         }
-        stats.total_cost += obs.calculated_total_cost.unwrap_or(0.0);
     }
+
+    stats.model_breakdown = model_map
+        .into_iter()
+        .map(|(model, (count, tokens_in, tokens_out, cost))| ModelStats {
+            model,
+            count,
+            tokens_in,
+            tokens_out,
+            cost,
+        })
+        .collect();
+    stats.model_breakdown.sort_by(|a, b| {
+        b.cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     if let (Some(earliest), Some(latest)) = (earliest_start(observations), latest_end(observations))
     {
@@ -296,6 +324,78 @@ mod tests {
         assert_eq!(stats.total_tokens_in, 100);
         assert_eq!(stats.total_tokens_out, 50);
         assert!((stats.total_cost - 0.003).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn model_breakdown_aggregates_per_model() {
+        let mut gen1 = obs(
+            "call-1",
+            None,
+            SpanKind::Generation,
+            "2026-06-10T14:00:00.000Z",
+            Some("2026-06-10T14:00:01.000Z"),
+        );
+        gen1.model = Some("gpt-4o".into());
+        gen1.usage = Some(Usage {
+            input: Some(100),
+            output: Some(50),
+            total: Some(150),
+            unit: None,
+        });
+        gen1.calculated_total_cost = Some(0.01);
+
+        let mut gen2 = obs(
+            "call-2",
+            None,
+            SpanKind::Generation,
+            "2026-06-10T14:00:01.000Z",
+            Some("2026-06-10T14:00:02.000Z"),
+        );
+        gen2.model = Some("gpt-4o".into());
+        gen2.usage = Some(Usage {
+            input: Some(200),
+            output: Some(100),
+            total: Some(300),
+            unit: None,
+        });
+        gen2.calculated_total_cost = Some(0.02);
+
+        let mut gen3 = obs(
+            "call-3",
+            None,
+            SpanKind::Generation,
+            "2026-06-10T14:00:02.000Z",
+            Some("2026-06-10T14:00:03.000Z"),
+        );
+        gen3.model = Some("claude-3-haiku".into());
+        gen3.usage = Some(Usage {
+            input: Some(50),
+            output: Some(25),
+            total: Some(75),
+            unit: None,
+        });
+        gen3.calculated_total_cost = Some(0.001);
+
+        let (_, stats) = build_tree(&[gen1, gen2, gen3]);
+        assert_eq!(stats.model_breakdown.len(), 2);
+
+        let gpt = stats
+            .model_breakdown
+            .iter()
+            .find(|m| m.model == "gpt-4o")
+            .unwrap();
+        assert_eq!(gpt.count, 2);
+        assert_eq!(gpt.tokens_in, 300);
+        assert_eq!(gpt.tokens_out, 150);
+        assert!((gpt.cost - 0.03).abs() < f64::EPSILON);
+
+        let claude = stats
+            .model_breakdown
+            .iter()
+            .find(|m| m.model == "claude-3-haiku")
+            .unwrap();
+        assert_eq!(claude.count, 1);
+        assert_eq!(claude.tokens_in, 50);
     }
 
     #[test]
