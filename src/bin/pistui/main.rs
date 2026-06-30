@@ -57,16 +57,40 @@ async fn main() -> Result<()> {
 fn build_env_explain() -> Option<pistui::explain::ExplainClient> {
     let api_key = std::env::var("LLM_API_KEY")
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-        .ok()?;
+        .ok();
 
     let base_url =
-        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+        std::env::var("LLM_BASE_URL").unwrap_or_else(|_| pistui::explain::DEFAULT_BASE_URL.into());
 
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let model =
+        std::env::var("LLM_MODEL").unwrap_or_else(|_| pistui::explain::DEFAULT_MODEL.into());
 
-    eprintln!("explain enabled ({model} via {base_url})");
-    Some(pistui::explain::ExplainClient::new(
-        &api_key, &base_url, &model,
-    ))
+    // ANTHROPIC_API_KEY needs a different base_url — the Anthropic API is not
+    // OpenAI-compatible. Users should set LLM_BASE_URL alongside it.
+    if api_key.is_none() {
+        if let Ok(anthropic_key) = std::env::var("ANTHROPIC_API_KEY") {
+            if std::env::var("LLM_BASE_URL").is_err() {
+                eprintln!(
+                    "warning: ANTHROPIC_API_KEY is set but LLM_BASE_URL is not — \
+                     set LLM_BASE_URL to the Anthropic-compatible endpoint and LLM_MODEL \
+                     to use it for explain"
+                );
+                let _ = anthropic_key;
+                return None;
+            }
+        }
+    }
+
+    let api_key = api_key?;
+
+    match pistui::explain::ExplainClient::new(&api_key, &base_url, &model) {
+        Ok(client) => {
+            eprintln!("explain enabled ({model} via {base_url})");
+            Some(client)
+        }
+        Err(e) => {
+            eprintln!("warning: explain setup failed: {e}");
+            None
+        }
+    }
 }

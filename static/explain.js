@@ -229,7 +229,7 @@
       if (!resp.ok) {
         var body = await resp.json().catch(function () { return {}; });
         var errMsg = body.error || resp.statusText;
-        if (resp.status === 400 || resp.status === 502) {
+        if (resp.status === 400) {
           clearConfig();
         }
         throw new Error(errMsg);
@@ -242,24 +242,24 @@
       text.innerHTML = formatExplanation(data.explanation);
       result.appendChild(text);
 
-      var actions = el('div', 'explain-actions');
+      var explainActions = el('div', 'explain-actions');
       var copyBtn = el('button', 'btn', 'copy');
       copyBtn.addEventListener('click', function () {
         navigator.clipboard.writeText(data.explanation).then(function () {
           copyBtn.textContent = 'copied';
           setTimeout(function () { copyBtn.textContent = 'copy'; }, 1500);
-        });
+        }).catch(function () {});
       });
-      actions.appendChild(copyBtn);
+      explainActions.appendChild(copyBtn);
 
       var rerunBtn = el('button', 'btn', 'run again');
       rerunBtn.addEventListener('click', function () {
         var pi = wrapper.querySelector('.explain-prompt');
         runExplain(wrapper, traceId, loadConfig() || config, pi ? pi.value.trim() : '');
       });
-      actions.appendChild(rerunBtn);
+      explainActions.appendChild(rerunBtn);
 
-      result.appendChild(actions);
+      result.appendChild(explainActions);
     } catch (e) {
       result.innerHTML = '';
       var errEl = el('div', 'explain-error');
@@ -275,7 +275,7 @@
       retryActions.appendChild(settingsBtn);
       result.appendChild(retryActions);
     } finally {
-      if (btn) { btn.disabled = false; btn.textContent = 'explain this trace'; }
+      if (btn) { btn.disabled = false; btn.textContent = 'explain'; }
     }
   }
 

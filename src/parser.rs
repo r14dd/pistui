@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::model::{ModelStats, Observation, SpanKind, SpanNode, SpanStatus, TraceStats};
+use crate::model::{ModelStats, Observation, Score, SpanKind, SpanNode, SpanStatus, TraceStats};
 
-pub fn build_tree(observations: &[Observation]) -> (Vec<SpanNode>, TraceStats) {
+pub fn build_tree(observations: &[Observation], scores: &[Score]) -> (Vec<SpanNode>, TraceStats) {
+    let obs_ids: HashSet<&str> = observations.iter().map(|o| o.id.as_str()).collect();
+
     let mut children_map: HashMap<Option<&str>, Vec<&Observation>> = HashMap::new();
     for obs in observations {
         children_map
@@ -15,14 +17,38 @@ pub fn build_tree(observations: &[Observation]) -> (Vec<SpanNode>, TraceStats) {
         group.sort_by(|a, b| a.start_time.cmp(&b.start_time));
     }
 
-    let roots = build_children(None, &children_map);
-    let stats = compute_stats(&roots, observations);
+    // Build score lookup by observation_id
+    let mut score_map: HashMap<&str, Vec<&Score>> = HashMap::new();
+    for score in scores {
+        if let Some(obs_id) = score.observation_id.as_deref() {
+            score_map.entry(obs_id).or_default().push(score);
+        }
+    }
+
+    let mut roots = build_children(None, &children_map, &score_map);
+
+    // Re-root orphans: observations whose declared parent doesn't exist in this trace
+    let mut orphan_count = 0;
+    for parent_id in children_map.keys().copied().flatten() {
+        if !obs_ids.contains(parent_id) {
+            let orphans = build_children(Some(parent_id), &children_map, &score_map);
+            orphan_count += orphans.len();
+            roots.extend(orphans);
+        }
+    }
+
+    // Sort all roots by start time
+    roots.sort_by(|a, b| a.start_time.cmp(&b.start_time));
+
+    let mut stats = compute_stats(&roots, observations);
+    stats.orphan_count = orphan_count;
     (roots, stats)
 }
 
-fn build_children(
+fn build_children<'a>(
     parent_id: Option<&str>,
-    children_map: &HashMap<Option<&str>, Vec<&Observation>>,
+    children_map: &HashMap<Option<&'a str>, Vec<&'a Observation>>,
+    score_map: &HashMap<&str, Vec<&Score>>,
 ) -> Vec<SpanNode> {
     let Some(children) = children_map.get(&parent_id) else {
         return Vec::new();
@@ -31,13 +57,28 @@ fn build_children(
     children
         .iter()
         .map(|obs| {
-            let children = build_children(Some(&obs.id), children_map);
+            let children = build_children(Some(&obs.id), children_map, score_map);
             let duration_ms = duration_between(&obs.start_time, obs.end_time.as_deref());
-            let status = if obs.level.as_deref() == Some("ERROR") || obs.status_message.is_some() {
+            let ttft_ms = if obs.kind == SpanKind::Generation {
+                obs.completion_start_time
+                    .as_deref()
+                    .and_then(|ct| duration_between(&obs.start_time, Some(ct)))
+            } else {
+                None
+            };
+
+            let status = if is_error(obs) {
                 SpanStatus::Error
             } else {
                 SpanStatus::Ok
             };
+
+            let (tokens_in, tokens_out, tokens_total) = token_counts(obs);
+
+            let scores = score_map
+                .get(obs.id.as_str())
+                .map(|v| v.iter().map(|s| (*s).clone()).collect())
+                .unwrap_or_default();
 
             SpanNode {
                 id: obs.id.clone(),
@@ -46,18 +87,43 @@ fn build_children(
                 start_time: obs.start_time.clone(),
                 end_time: obs.end_time.clone(),
                 duration_ms,
+                ttft_ms,
                 status,
                 status_message: obs.status_message.clone(),
                 model: obs.model.clone(),
                 input: obs.input.clone(),
                 output: obs.output.clone(),
-                tokens_in: obs.usage.as_ref().and_then(|u| u.input),
-                tokens_out: obs.usage.as_ref().and_then(|u| u.output),
+                metadata: obs.metadata.clone(),
+                tokens_in,
+                tokens_out,
+                tokens_total,
                 cost: obs.calculated_total_cost,
+                scores,
                 children,
             }
         })
         .collect()
+}
+
+pub fn is_error(obs: &Observation) -> bool {
+    obs.level.as_deref() == Some("ERROR")
+}
+
+fn token_counts(obs: &Observation) -> (Option<u64>, Option<u64>, Option<u64>) {
+    match &obs.usage {
+        None => (None, None, None),
+        Some(u) => {
+            let tin = u.input;
+            let tout = u.output;
+            let ttotal = u.total;
+            // Prefer explicit in/out; fall back to total when both are absent
+            let effective_total = match (tin, tout, ttotal) {
+                (None, None, Some(t)) => Some(t),
+                _ => ttotal,
+            };
+            (tin, tout, effective_total)
+        }
+    }
 }
 
 fn duration_between(start: &str, end: Option<&str>) -> Option<f64> {
@@ -79,6 +145,8 @@ fn compute_stats(roots: &[SpanNode], observations: &[Observation]) -> TraceStats
         event_count: 0,
         error_count: 0,
         deepest_nesting: 0,
+        orphan_count: 0,
+        truncated: false,
         model_breakdown: Vec::new(),
     };
 
@@ -90,21 +158,27 @@ fn compute_stats(roots: &[SpanNode], observations: &[Observation]) -> TraceStats
             SpanKind::Generation => stats.generation_count += 1,
             SpanKind::Event => stats.event_count += 1,
         }
-        if obs.level.as_deref() == Some("ERROR") || obs.status_message.is_some() {
+        if is_error(obs) {
             stats.error_count += 1;
         }
-        let tin = obs.usage.as_ref().and_then(|u| u.input).unwrap_or(0);
-        let tout = obs.usage.as_ref().and_then(|u| u.output).unwrap_or(0);
-        stats.total_tokens_in += tin;
-        stats.total_tokens_out += tout;
+
+        let (tin, tout, ttotal) = token_counts(obs);
+        // Use explicit in/out for totals; fall back to total only when both are absent
+        let counted_in = tin.or_else(|| if tout.is_none() { ttotal } else { None });
+        let counted_out = tout.unwrap_or(0);
+        stats.total_tokens_in = stats
+            .total_tokens_in
+            .saturating_add(counted_in.unwrap_or(0));
+        stats.total_tokens_out = stats.total_tokens_out.saturating_add(counted_out);
+
         let cost = obs.calculated_total_cost.unwrap_or(0.0);
         stats.total_cost += cost;
 
         if let Some(model) = &obs.model {
             let entry = model_map.entry(model.clone()).or_default();
             entry.0 += 1;
-            entry.1 += tin;
-            entry.2 += tout;
+            entry.1 = entry.1.saturating_add(counted_in.unwrap_or(0));
+            entry.2 = entry.2.saturating_add(counted_out);
             entry.3 += cost;
         }
     }
@@ -123,6 +197,7 @@ fn compute_stats(roots: &[SpanNode], observations: &[Observation]) -> TraceStats
         b.cost
             .partial_cmp(&a.cost)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model))
     });
 
     if let (Some(earliest), Some(latest)) = (earliest_start(observations), latest_end(observations))
@@ -191,7 +266,7 @@ mod tests {
 
     #[test]
     fn empty_observations_produce_empty_tree() {
-        let (tree, stats) = build_tree(&[]);
+        let (tree, stats) = build_tree(&[], &[]);
         assert!(tree.is_empty());
         assert_eq!(stats.span_count, 0);
     }
@@ -205,7 +280,7 @@ mod tests {
             "2026-06-10T14:00:00.000Z",
             Some("2026-06-10T14:00:01.000Z"),
         )];
-        let (tree, stats) = build_tree(&observations);
+        let (tree, stats) = build_tree(&observations, &[]);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].name, "root");
         assert_eq!(tree[0].duration_ms, Some(1000.0));
@@ -246,7 +321,7 @@ mod tests {
                 Some("2026-06-10T14:00:01.000Z"),
             ),
         ];
-        let (tree, stats) = build_tree(&observations);
+        let (tree, stats) = build_tree(&observations, &[]);
 
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].children.len(), 2);
@@ -279,15 +354,16 @@ mod tests {
                 Some("2026-06-10T14:00:02.000Z"),
             ),
         ];
-        let (tree, _) = build_tree(&observations);
-        // The orphan attaches under its declared parent key "nonexistent",
-        // which won't match any node, so it remains a separate root-level group.
-        assert_eq!(tree.len(), 1);
-        assert_eq!(tree[0].name, "root");
+        let (tree, stats) = build_tree(&observations, &[]);
+        // Orphan is re-rooted rather than dropped
+        assert_eq!(tree.len(), 2);
+        assert!(tree.iter().any(|n| n.name == "root"));
+        assert!(tree.iter().any(|n| n.name == "orphan"));
+        assert_eq!(stats.orphan_count, 1);
     }
 
     #[test]
-    fn error_status_detected() {
+    fn error_status_requires_level_error() {
         let mut error_obs = obs(
             "fail",
             None,
@@ -298,9 +374,26 @@ mod tests {
         error_obs.level = Some("ERROR".into());
         error_obs.status_message = Some("boom".into());
 
-        let (tree, stats) = build_tree(&[error_obs]);
+        let (tree, stats) = build_tree(&[error_obs], &[]);
         assert_eq!(tree[0].status, SpanStatus::Error);
         assert_eq!(stats.error_count, 1);
+    }
+
+    #[test]
+    fn status_message_without_error_level_is_not_an_error() {
+        let mut ok_obs = obs(
+            "note",
+            None,
+            SpanKind::Span,
+            "2026-06-10T14:00:00.000Z",
+            Some("2026-06-10T14:00:01.000Z"),
+        );
+        // status_message without level == ERROR is just informational
+        ok_obs.status_message = Some("cache miss".into());
+
+        let (tree, stats) = build_tree(&[ok_obs], &[]);
+        assert_eq!(tree[0].status, SpanStatus::Ok);
+        assert_eq!(stats.error_count, 0);
     }
 
     #[test]
@@ -320,10 +413,33 @@ mod tests {
         });
         gen.calculated_total_cost = Some(0.003);
 
-        let (_, stats) = build_tree(&[gen]);
+        let (_, stats) = build_tree(&[gen], &[]);
         assert_eq!(stats.total_tokens_in, 100);
         assert_eq!(stats.total_tokens_out, 50);
         assert!((stats.total_cost - 0.003).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn token_fallback_to_total_when_in_out_absent() {
+        let mut gen = obs(
+            "llm",
+            None,
+            SpanKind::Generation,
+            "2026-06-10T14:00:00.000Z",
+            Some("2026-06-10T14:00:01.000Z"),
+        );
+        gen.usage = Some(Usage {
+            input: None,
+            output: None,
+            total: Some(200),
+            unit: None,
+        });
+
+        let (tree, stats) = build_tree(&[gen], &[]);
+        // When only total is present, it falls through to total_tokens_in as the best approximation
+        assert_eq!(tree[0].tokens_total, Some(200));
+        assert_eq!(stats.total_tokens_in, 200);
+        assert_eq!(stats.total_tokens_out, 0);
     }
 
     #[test]
@@ -376,7 +492,7 @@ mod tests {
         });
         gen3.calculated_total_cost = Some(0.001);
 
-        let (_, stats) = build_tree(&[gen1, gen2, gen3]);
+        let (_, stats) = build_tree(&[gen1, gen2, gen3], &[]);
         assert_eq!(stats.model_breakdown.len(), 2);
 
         let gpt = stats
@@ -396,6 +512,33 @@ mod tests {
             .unwrap();
         assert_eq!(claude.count, 1);
         assert_eq!(claude.tokens_in, 50);
+    }
+
+    #[test]
+    fn model_breakdown_breaks_cost_ties_alphabetically() {
+        let mut gen1 = obs(
+            "a",
+            None,
+            SpanKind::Generation,
+            "2026-06-10T14:00:00.000Z",
+            Some("2026-06-10T14:00:01.000Z"),
+        );
+        gen1.model = Some("zebra".into());
+        gen1.calculated_total_cost = Some(0.01);
+
+        let mut gen2 = obs(
+            "b",
+            None,
+            SpanKind::Generation,
+            "2026-06-10T14:00:01.000Z",
+            Some("2026-06-10T14:00:02.000Z"),
+        );
+        gen2.model = Some("alpha".into());
+        gen2.calculated_total_cost = Some(0.01);
+
+        let (_, stats) = build_tree(&[gen1, gen2], &[]);
+        assert_eq!(stats.model_breakdown[0].model, "alpha");
+        assert_eq!(stats.model_breakdown[1].model, "zebra");
     }
 
     #[test]
@@ -423,8 +566,49 @@ mod tests {
                 Some("2026-06-10T14:00:02.000Z"),
             ),
         ];
-        let (tree, _) = build_tree(&observations);
+        let (tree, _) = build_tree(&observations, &[]);
         assert_eq!(tree[0].children[0].name, "early");
         assert_eq!(tree[0].children[1].name, "late");
+    }
+
+    #[test]
+    fn scores_attached_to_matching_span() {
+        use crate::model::Score;
+        let observations = vec![obs(
+            "obs-1",
+            None,
+            SpanKind::Generation,
+            "2026-06-10T14:00:00.000Z",
+            Some("2026-06-10T14:00:01.000Z"),
+        )];
+        let scores = vec![Score {
+            id: "s-1".into(),
+            trace_id: "trace-1".into(),
+            name: "accuracy".into(),
+            value: Some(0.9),
+            string_value: None,
+            comment: None,
+            observation_id: Some("obs-1".into()),
+            source: None,
+            data_type: Some("NUMERIC".into()),
+        }];
+        let (tree, _) = build_tree(&observations, &scores);
+        assert_eq!(tree[0].scores.len(), 1);
+        assert_eq!(tree[0].scores[0].name, "accuracy");
+    }
+
+    #[test]
+    fn ttft_computed_for_generation_with_completion_start_time() {
+        let mut gen = obs(
+            "llm",
+            None,
+            SpanKind::Generation,
+            "2026-06-10T14:00:00.000Z",
+            Some("2026-06-10T14:00:02.000Z"),
+        );
+        gen.completion_start_time = Some("2026-06-10T14:00:00.500Z".into());
+
+        let (tree, _) = build_tree(&[gen], &[]);
+        assert_eq!(tree[0].ttft_ms, Some(500.0));
     }
 }

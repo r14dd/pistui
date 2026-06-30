@@ -20,7 +20,7 @@
       navigator.clipboard.writeText(data.trace.id).then(function () {
         copyId.textContent = 'copied';
         setTimeout(function () { copyId.textContent = 'copy ID'; }, 1500);
-      });
+      }).catch(function () {});
     });
     headerActions.appendChild(copyId);
 
@@ -41,17 +41,33 @@
     hdr.appendChild(headerActions);
     container.appendChild(hdr);
 
+    var traceIo = buildTraceIoPanel(data.trace);
+    if (traceIo) container.appendChild(traceIo);
+
     var meta = renderMetadata(data.trace);
     if (meta) container.appendChild(meta);
 
     container.appendChild(renderStats(data.stats));
 
+    var notices = renderTraceNotices(data.stats);
+    if (notices) container.appendChild(notices);
+
     if (data.stats.modelBreakdown && data.stats.modelBreakdown.length > 0) {
       container.appendChild(renderModelBreakdown(data.stats.modelBreakdown));
     }
 
-    if (data.scores && data.scores.length > 0) {
-      container.appendChild(renderScores(data.scores));
+    var renderedIds = {};
+    (function collectIds(nodes) {
+      (nodes || []).forEach(function (n) {
+        renderedIds[n.id] = true;
+        collectIds(n.children);
+      });
+    })(data.tree);
+    var traceScores = (data.scores || []).filter(function (s) {
+      return s.observationId == null || !renderedIds[s.observationId];
+    });
+    if (traceScores.length > 0) {
+      container.appendChild(renderScores(traceScores));
     }
 
     if (window.renderExplainButton) {
@@ -162,6 +178,26 @@
     return min;
   }
 
+  function buildTraceIoPanel(trace) {
+    var hasInput = trace.input != null;
+    var hasOutput = trace.output != null;
+    if (!hasInput && !hasOutput) return null;
+
+    var panel = el('div', 'trace-io-panel');
+    var tabs = el('div', 'detail-tabs');
+    var sections = [];
+
+    if (hasInput) addTab(tabs, sections, panel, 'Input', trace.input);
+    if (hasOutput) addTab(tabs, sections, panel, 'Output', trace.output);
+
+    panel.appendChild(tabs);
+    sections.forEach(function (s) { panel.appendChild(s); });
+
+    if (tabs.children.length > 0) tabs.children[0].click();
+
+    return panel;
+  }
+
   function renderStats(stats) {
     var bar = el('div', 'stats-bar');
     stat(bar, 'Duration', stats.totalDurationMs != null ? fmtDuration(stats.totalDurationMs) : '-', 'stat-duration');
@@ -180,6 +216,21 @@
     item.appendChild(el('span', 'stat-label', label));
     item.appendChild(el('span', 'stat-value', String(value)));
     bar.appendChild(item);
+  }
+
+  function renderTraceNotices(stats) {
+    var box = el('div', 'trace-notices');
+    if (stats.truncated) {
+      box.appendChild(el('div', 'trace-notice warn',
+        'This trace was large and has been trimmed — some observations are not shown.'));
+    }
+    if (stats.orphanCount > 0) {
+      var n = stats.orphanCount;
+      box.appendChild(el('div', 'trace-notice info',
+        n + ' observation' + (n === 1 ? '' : 's') + ' had a missing parent and ' +
+        (n === 1 ? 'was' : 'were') + ' re-rooted to the top.'));
+    }
+    return box.children.length > 0 ? box : null;
   }
 
   function renderNode(node, depth, totalMs, traceStart) {
@@ -210,12 +261,19 @@
 
     var copySpan = el('span', 'copy-span-id', '⎘');
     copySpan.title = 'Copy span ID: ' + node.id;
+    copySpan.tabIndex = 0;
     copySpan.addEventListener('click', function (e) {
       e.stopPropagation();
       navigator.clipboard.writeText(node.id).then(function () {
         copySpan.textContent = '✓';
         setTimeout(function () { copySpan.textContent = '⎘'; }, 1200);
-      });
+      }).catch(function () {});
+    });
+    copySpan.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        copySpan.click();
+      }
     });
     row.appendChild(copySpan);
 
@@ -225,6 +283,19 @@
 
     if (node.durationMs != null) {
       row.appendChild(el('span', 'node-duration', fmtDuration(node.durationMs)));
+    }
+
+    if (node.ttftMs != null && node.kind === 'GENERATION') {
+      var ttft = el('span', 'node-ttft', 'ttft ' + fmtDuration(node.ttftMs));
+      row.appendChild(ttft);
+    }
+
+    if (node.scores && node.scores.length > 0) {
+      node.scores.forEach(function (s) {
+        var badge = el('span', 'score-badge', fmtScoreBadge(s));
+        badge.title = s.name + ': ' + fmtScoreValue(s);
+        row.appendChild(badge);
+      });
     }
 
     if (totalMs && totalMs > 0 && traceStart !== Infinity) {
@@ -257,6 +328,19 @@
     });
 
     return wrapper;
+  }
+
+  function fmtScoreBadge(s) {
+    if (s.dataType === 'BOOLEAN') return s.value === 1 ? '✓' : '✗';
+    if (s.dataType === 'CATEGORICAL') return s.stringValue || s.name.slice(0, 4);
+    if (s.value != null) return String(Math.round(s.value * 100) / 100);
+    return s.stringValue || '?';
+  }
+
+  function fmtScoreValue(s) {
+    if (s.dataType === 'BOOLEAN') return s.value === 1 ? 'true' : 'false';
+    if (s.value != null) return String(s.value);
+    return s.stringValue || '-';
   }
 
   function buildWaterfall(node, totalMs, traceStart) {
@@ -308,6 +392,9 @@
     if (node.statusMessage) {
       addTab(tabs, sections, panel, 'Error', node.statusMessage);
     }
+    if (node.metadata != null) {
+      addTab(tabs, sections, panel, 'Metadata', node.metadata);
+    }
 
     if (tabs.children.length === 0) {
       panel.appendChild(el('div', 'empty-state', 'no data'));
@@ -329,7 +416,7 @@
         navigator.clipboard.writeText(active.textContent).then(function () {
           copyBtn.textContent = 'copied';
           setTimeout(function () { copyBtn.textContent = 'copy'; }, 1500);
-        });
+        }).catch(function () {});
       }
     });
     actions.appendChild(copyBtn);
@@ -362,7 +449,8 @@
     if (trace.sessionId) items.push(['Session', trace.sessionId]);
     if (trace.release) items.push(['Release', trace.release]);
     if (trace.timestamp) items.push(['Timestamp', new Date(trace.timestamp).toLocaleString()]);
-    if (items.length === 0) return null;
+    var hasTags = Array.isArray(trace.tags) && trace.tags.length > 0;
+    if (items.length === 0 && !hasTags) return null;
 
     var bar = el('div', 'metadata-bar');
     items.forEach(function (pair) {
@@ -371,6 +459,18 @@
       item.appendChild(el('span', 'meta-value', pair[1]));
       bar.appendChild(item);
     });
+
+    if (hasTags) {
+      var tagsItem = el('div', 'meta-item');
+      tagsItem.appendChild(el('span', 'meta-label', 'Tags'));
+      var tagsWrap = el('span', 'meta-tags');
+      trace.tags.forEach(function (tag) {
+        tagsWrap.appendChild(el('span', 'tag', tag));
+      });
+      tagsItem.appendChild(tagsWrap);
+      bar.appendChild(tagsItem);
+    }
+
     return bar;
   }
 
@@ -412,8 +512,17 @@
     scores.forEach(function (s) {
       var item = el('div', 'score-item');
       item.appendChild(el('span', 'score-name', s.name));
-      var val = s.value != null ? String(s.value) : (s.stringValue || '-');
+
+      var val;
+      if (s.dataType === 'BOOLEAN') {
+        val = s.value === 1 ? 'true' : 'false';
+      } else if (s.dataType === 'CATEGORICAL') {
+        val = s.stringValue || '-';
+      } else {
+        val = s.value != null ? String(s.value) : (s.stringValue || '-');
+      }
       item.appendChild(el('span', 'score-value', val));
+
       if (s.comment) {
         item.appendChild(el('span', 'score-comment', s.comment));
       }

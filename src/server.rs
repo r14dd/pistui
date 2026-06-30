@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::cache::TraceCache;
-use crate::explain::ExplainClient;
+use crate::explain::{self, ExplainClient};
+use crate::model::{Score, SpanNode, Trace, TraceStats};
 
 #[derive(Embed)]
 #[folder = "static/"]
@@ -46,22 +47,53 @@ pub fn router_with_state(state: Arc<AppState>) -> Router {
         .fallback(static_handler)
 }
 
+// Lean summary for the list view — excludes large input/output blobs.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceSummary<'a> {
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    timestamp: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_cost: Option<f64>,
+    tags: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release: Option<&'a str>,
+}
+
+impl<'a> From<&'a Trace> for TraceSummary<'a> {
+    fn from(t: &'a Trace) -> Self {
+        Self {
+            id: &t.id,
+            name: t.name.as_deref(),
+            timestamp: &t.timestamp,
+            latency: t.latency,
+            total_cost: t.total_cost,
+            tags: &t.tags,
+            user_id: t.user_id.as_deref(),
+            session_id: t.session_id.as_deref(),
+            release: t.release.as_deref(),
+        }
+    }
+}
+
 async fn list_traces(State(state): State<Arc<AppState>>) -> Response {
-    axum::Json(state.cache.traces().await).into_response()
+    let traces = state.cache.traces().await;
+    let summaries: Vec<TraceSummary<'_>> = traces.iter().map(TraceSummary::from).collect();
+    axum::Json(summaries).into_response()
 }
 
 async fn get_trace(State(state): State<Arc<AppState>>, Path(trace_id): Path<String>) -> Response {
     match state.cache.trace_detail(&trace_id).await {
         Ok((trace, tree, stats, scores)) => {
-            let mut body = serde_json::json!({
-                "trace": trace,
-                "tree": tree,
-                "stats": stats,
-            });
-            if !scores.is_empty() {
-                body["scores"] = serde_json::json!(scores);
-            }
-            axum::Json(body).into_response()
+            axum::Json(detail_body(trace, tree, stats, scores)).into_response()
         }
         Err(e) => error_response(&e),
     }
@@ -73,14 +105,7 @@ async fn export_trace(
 ) -> Response {
     match state.cache.trace_detail(&trace_id).await {
         Ok((trace, tree, stats, scores)) => {
-            let mut body = serde_json::json!({
-                "trace": trace,
-                "tree": tree,
-                "stats": stats,
-            });
-            if !scores.is_empty() {
-                body["scores"] = serde_json::json!(scores);
-            }
+            let body = detail_body(trace, tree, stats, scores);
             let filename = format!("pistui-{trace_id}.json");
             (
                 [
@@ -98,6 +123,23 @@ async fn export_trace(
     }
 }
 
+fn detail_body(
+    trace: Trace,
+    tree: Vec<SpanNode>,
+    stats: TraceStats,
+    scores: Vec<Score>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "trace": trace,
+        "tree": tree,
+        "stats": stats,
+    });
+    if !scores.is_empty() {
+        body["scores"] = serde_json::json!(scores);
+    }
+    body
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionSummary {
@@ -111,7 +153,7 @@ struct SessionSummary {
 
 async fn list_sessions(State(state): State<Arc<AppState>>) -> Response {
     let traces = state.cache.traces().await;
-    let mut groups: HashMap<String, Vec<&crate::model::Trace>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<&Trace>> = HashMap::new();
 
     for trace in &traces {
         if let Some(sid) = &trace.session_id {
@@ -177,11 +219,17 @@ async fn explain_trace(
     body: Option<axum::Json<ExplainRequest>>,
 ) -> Response {
     let req = body.map(|b| b.0);
+
+    // Build a per-request client when base_url or api_key is provided.
+    // An empty api_key is valid for keyless local providers (e.g. Ollama).
     let client_from_request = req.as_ref().and_then(|r| {
-        let key = r.api_key.as_deref()?;
-        let base = r.base_url.as_deref().unwrap_or("https://api.openai.com/v1");
-        let model = r.model.as_deref().unwrap_or("gpt-4o-mini");
-        Some(ExplainClient::new(key, base, model))
+        if r.base_url.is_none() && r.api_key.is_none() {
+            return None;
+        }
+        let key = r.api_key.as_deref().unwrap_or("");
+        let base = r.base_url.as_deref().unwrap_or(explain::DEFAULT_BASE_URL);
+        let model = r.model.as_deref().unwrap_or(explain::DEFAULT_MODEL);
+        ExplainClient::new(key, base, model).ok()
     });
 
     let client = client_from_request.as_ref().or(state.env_explain.as_ref());
@@ -230,7 +278,8 @@ fn error_response(err: &crate::model::Error) -> Response {
         crate::model::Error::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
         crate::model::Error::RateLimit => (StatusCode::TOO_MANY_REQUESTS, err.to_string()),
         crate::model::Error::Explain(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
-        _ => (StatusCode::BAD_GATEWAY, err.to_string()),
+        crate::model::Error::Upstream(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
     (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
 }

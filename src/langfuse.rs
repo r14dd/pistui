@@ -88,16 +88,27 @@ impl Client {
         }
         Ok(all)
     }
+
     pub async fn get_scores(&self, trace_id: &str) -> Result<Vec<Score>> {
-        let url = format!(
-            "{}/api/public/scores?traceid={trace_id}&limit=100",
-            self.base_url
-        );
-        let resp = self.http.get(&url).send().await?;
-        let resp = map_status(resp).await?;
-        let paged: PagedResponse<Score> =
-            resp.json().await.map_err(|e| Error::Parse(e.to_string()))?;
-        Ok(paged.data)
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let url = format!(
+                "{}/api/public/scores?traceId={trace_id}&limit=100&page={page}",
+                self.base_url
+            );
+            let resp = self.http.get(&url).send().await?;
+            let resp = map_status(resp).await?;
+            let paged: PagedResponse<Score> =
+                resp.json().await.map_err(|e| Error::Parse(e.to_string()))?;
+            let count = paged.data.len();
+            all.extend(paged.data);
+            if count < 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(all)
     }
 }
 
@@ -105,13 +116,13 @@ async fn map_status(resp: reqwest::Response) -> Result<reqwest::Response> {
     let status = resp.status().as_u16();
     match status {
         200..=299 => Ok(resp),
-        401 | 403 => {
-            let body = resp.text().await.unwrap_or_default();
-            eprintln!("langfuse auth failed (HTTP {status}): {body}");
-            Err(Error::Auth)
-        }
+        401 | 403 => Err(Error::Auth),
         404 => Err(Error::NotFound("resource not found".into())),
         429 => Err(Error::RateLimit),
+        500..=599 => {
+            let body = resp.text().await.unwrap_or_default();
+            Err(Error::Upstream(format!("HTTP {status}: {body}")))
+        }
         _ => {
             let body = resp.text().await.unwrap_or_default();
             let msg = if body.is_empty() {
@@ -245,6 +256,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn returns_upstream_error_on_500() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/public/traces"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri());
+        let err = client.list_traces(50, 1).await.unwrap_err();
+        assert!(matches!(err, Error::Upstream(_)));
+    }
+
+    #[tokio::test]
     async fn get_scores_parses_response() {
         let server = MockServer::start().await;
         let body = serde_json::json!({
@@ -268,7 +293,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/public/scores"))
-            .and(query_param("traceid", "trace-1"))
+            .and(query_param("traceId", "trace-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&body))
             .expect(1)
             .mount(&server)
@@ -299,5 +324,96 @@ mod tests {
         let client = Client::new(&server.uri(), "pk", "sk").unwrap();
         let traces = client.list_traces(50, 1).await.unwrap();
         assert!(traces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_observations_follows_pagination() {
+        let server = MockServer::start().await;
+
+        let page1: Vec<serde_json::Value> = (0..100)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("obs-{i}"),
+                    "traceId": "trace-1",
+                    "type": "SPAN",
+                    "name": "span",
+                    "startTime": "2026-06-10T14:00:00.000Z",
+                    "endTime": "2026-06-10T14:00:01.000Z"
+                })
+            })
+            .collect();
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/observations"))
+            .and(query_param("page", "1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": page1 })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/observations"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "id": "obs-last",
+                    "traceId": "trace-1",
+                    "type": "SPAN",
+                    "name": "span",
+                    "startTime": "2026-06-10T14:00:00.000Z",
+                    "endTime": "2026-06-10T14:00:01.000Z"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri());
+        let obs = client.get_observations("trace-1").await.unwrap();
+        assert_eq!(obs.len(), 101);
+        assert_eq!(obs[100].id, "obs-last");
+    }
+
+    #[tokio::test]
+    async fn get_scores_follows_pagination() {
+        let server = MockServer::start().await;
+
+        let page1: Vec<serde_json::Value> = (0..100)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("s-{i}"),
+                    "traceId": "trace-1",
+                    "name": "accuracy",
+                    "value": 0.5
+                })
+            })
+            .collect();
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/scores"))
+            .and(query_param("page", "1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": page1 })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/scores"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "s-last", "traceId": "trace-1", "name": "accuracy", "value": 0.9 }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri());
+        let scores = client.get_scores("trace-1").await.unwrap();
+        assert_eq!(scores.len(), 101);
+        assert_eq!(scores[100].id, "s-last");
     }
 }

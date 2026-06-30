@@ -5,9 +5,12 @@
   var sortCol = 'timestamp';
   var sortAsc = false;
   var filterText = '';
-  var selectedIdx = -1;
+  var selectedTraceId = null;
   var appConfig = {};
   var viewMode = 'traces';
+  var listLoadedAt = null;
+  var comparing = false;
+  var compareSelection = [];
 
   window.addEventListener('hashchange', route);
   document.addEventListener('DOMContentLoaded', init);
@@ -32,10 +35,11 @@
     var match = hash.match(/^#\/traces\/(.+)$/);
     var compareMatch = hash.match(/^#\/compare\/([^/]+)\/(.+)$/);
     if (compareMatch) {
-      selectedIdx = -1;
+      comparing = false;
+      compareSelection = [];
       showCompare(decodeURIComponent(compareMatch[1]), decodeURIComponent(compareMatch[2]));
     } else if (match) {
-      selectedIdx = -1;
+      selectedTraceId = null;
       showTrace(decodeURIComponent(match[1]));
     } else if (hash === '#/sessions') {
       showSessions();
@@ -57,6 +61,7 @@
         throw new Error(body.error || resp.statusText);
       }
       traces = await resp.json();
+      listLoadedAt = Date.now();
       renderList();
     } catch (e) {
       app.innerHTML = '<div class="error-msg">failed to load traces: ' + esc(e.message) + '</div>';
@@ -164,7 +169,9 @@
       var q = filterText.toLowerCase();
       return (t.name || '').toLowerCase().includes(q) ||
              t.id.toLowerCase().includes(q) ||
-             (t.tags || []).some(function (tag) { return tag.toLowerCase().includes(q); });
+             (t.tags || []).some(function (tag) { return tag.toLowerCase().includes(q); }) ||
+             (t.userId || '').toLowerCase().includes(q) ||
+             (t.release || '').toLowerCase().includes(q);
     });
 
     var sorted = filtered.slice().sort(function (a, b) {
@@ -192,23 +199,20 @@
     input.value = filterText;
     input.addEventListener('input', function (e) {
       filterText = e.target.value;
-      selectedIdx = -1;
+      selectedTraceId = null;
       renderList();
     });
     bar.appendChild(input);
 
-    var compareBtn = el('button', 'btn compare-btn',
-      compareSelection.length > 0 ? 'cancel compare (' + compareSelection.length + '/2)' : 'compare');
+    var compareBtnLabel = comparing
+      ? 'cancel compare (' + compareSelection.length + '/2)'
+      : 'compare';
+    var compareBtn = el('button', 'btn compare-btn' + (comparing ? ' compare-active' : ''), compareBtnLabel);
     compareBtn.title = 'Select two traces to compare side-by-side';
     compareBtn.addEventListener('click', function () {
-      if (compareSelection.length > 0) {
-        compareSelection = [];
-        renderList();
-      } else {
-        compareSelection = [];
-        renderList();
-        compareBtn.textContent = 'cancel compare (0/2)';
-      }
+      comparing = !comparing;
+      compareSelection = [];
+      renderList();
     });
     bar.appendChild(compareBtn);
 
@@ -216,6 +220,12 @@
     refreshBtn.title = 'Fetch latest traces from Langfuse (R)';
     refreshBtn.addEventListener('click', doRefresh);
     bar.appendChild(refreshBtn);
+
+    if (listLoadedAt) {
+      var stale = el('span', 'staleness', 'loaded ' + fmtAgo(listLoadedAt));
+      stale.title = new Date(listLoadedAt).toLocaleString();
+      bar.appendChild(stale);
+    }
 
     app.appendChild(bar);
 
@@ -226,7 +236,7 @@
         var clearLink = el('span', 'empty-action', ' - clear filter');
         clearLink.addEventListener('click', function () {
           filterText = '';
-          selectedIdx = -1;
+          selectedTraceId = null;
           renderList();
         });
         empty.appendChild(clearLink);
@@ -238,8 +248,6 @@
       app.appendChild(empty);
       return;
     }
-
-    if (selectedIdx >= sorted.length) selectedIdx = sorted.length - 1;
 
     var table = el('table', 'trace-table');
     var thead = el('thead');
@@ -275,26 +283,27 @@
     table.appendChild(thead);
 
     var tbody = el('tbody');
-    sorted.forEach(function (t, idx) {
+    sorted.forEach(function (t) {
       var row = el('tr');
-      row.dataset.idx = idx;
-      if (idx === selectedIdx) row.classList.add('selected');
+      row.dataset.traceId = t.id;
+      if (t.id === selectedTraceId) row.classList.add('selected');
       if (compareSelection.indexOf(t.id) !== -1) row.classList.add('compare-selected');
 
       row.addEventListener('click', function () {
-        if (compareSelection.length > 0 && compareSelection.length < 2) {
-          if (compareSelection.indexOf(t.id) === -1) {
-            compareSelection.push(t.id);
-            if (compareSelection.length === 2) {
-              location.hash = '#/compare/' + encodeURIComponent(compareSelection[0]) + '/' + encodeURIComponent(compareSelection[1]);
-              compareSelection = [];
-            } else {
-              renderList();
-            }
-            return;
+        if (comparing && compareSelection.indexOf(t.id) === -1) {
+          compareSelection.push(t.id);
+          if (compareSelection.length === 2) {
+            comparing = false;
+            location.hash = '#/compare/' + encodeURIComponent(compareSelection[0]) + '/' + encodeURIComponent(compareSelection[1]);
+            compareSelection = [];
+          } else {
+            renderList();
           }
+          return;
         }
-        location.hash = '#/traces/' + encodeURIComponent(t.id);
+        if (!comparing) {
+          location.hash = '#/traces/' + encodeURIComponent(t.id);
+        }
       });
 
       row.appendChild(td(el('span', 'trace-name', t.name || '(unnamed)')));
@@ -322,32 +331,35 @@
     app.appendChild(table);
   }
 
+  function findSelectedRow() {
+    if (!selectedTraceId) return null;
+    return document.querySelector('.trace-table tbody tr[data-trace-id="' + CSS.escape(selectedTraceId) + '"]');
+  }
+
   function selectTraceRow(delta) {
-    var rows = document.querySelectorAll('.trace-table tbody tr');
+    var rows = Array.from(document.querySelectorAll('.trace-table tbody tr'));
     if (rows.length === 0) return;
 
-    var prev = rows[selectedIdx];
+    var curIdx = rows.findIndex(function (r) { return r.dataset.traceId === selectedTraceId; });
+
+    var prev = curIdx >= 0 ? rows[curIdx] : null;
     if (prev) prev.classList.remove('selected');
 
-    if (selectedIdx === -1) {
-      selectedIdx = delta > 0 ? 0 : rows.length - 1;
+    if (curIdx === -1) {
+      curIdx = delta > 0 ? 0 : rows.length - 1;
     } else {
-      selectedIdx += delta;
+      curIdx = Math.max(0, Math.min(rows.length - 1, curIdx + delta));
     }
 
-    if (selectedIdx < 0) selectedIdx = 0;
-    if (selectedIdx >= rows.length) selectedIdx = rows.length - 1;
-
-    var cur = rows[selectedIdx];
+    var cur = rows[curIdx];
     cur.classList.add('selected');
     cur.scrollIntoView({ block: 'nearest' });
+    selectedTraceId = cur.dataset.traceId;
   }
 
   function enterSelectedTrace() {
-    var rows = document.querySelectorAll('.trace-table tbody tr');
-    if (selectedIdx >= 0 && selectedIdx < rows.length) {
-      rows[selectedIdx].click();
-    }
+    var row = findSelectedRow();
+    if (row) row.click();
   }
 
   async function doRefresh() {
@@ -363,7 +375,7 @@
         var body = await resp.json().catch(function () { return {}; });
         throw new Error(body.error || resp.statusText);
       }
-      selectedIdx = -1;
+      selectedTraceId = null;
       await showList();
     } catch (e) {
       var app = document.getElementById('app');
@@ -391,15 +403,6 @@
     } catch (e) {
       app.innerHTML = '<div class="error-msg">failed to load trace: ' + esc(e.message) + '</div>';
     }
-  }
-
-  // --- compare mode ---
-
-  var compareSelection = [];
-
-  function toggleCompareMode() {
-    compareSelection = [];
-    renderList();
   }
 
   async function showCompare(idA, idB) {
@@ -541,9 +544,15 @@
         ['o', 'toggle input/output panel'],
         ['Esc', 'back to trace list'],
       ]},
+      { title: 'views', keys: [
+        ['sessions', 'group traces by session_id'],
+        ['compare', 'select 2 traces to diff side-by-side'],
+        ['export JSON', 'download full trace data'],
+      ]},
       { title: 'global', keys: [
         ['?', 'toggle this help'],
         ['/', 'focus filter input'],
+        ['Esc', 'close overlay / go back'],
       ]},
     ];
 
@@ -629,7 +638,7 @@
     if (onList) {
       if (e.key === 'j') { e.preventDefault(); selectTraceRow(1); }
       if (e.key === 'k') { e.preventDefault(); selectTraceRow(-1); }
-      if (e.key === 'Enter' && selectedIdx >= 0) { e.preventDefault(); enterSelectedTrace(); }
+      if (e.key === 'Enter' && selectedTraceId) { e.preventDefault(); enterSelectedTrace(); }
       if (e.key === 'r' || e.key === 'R') { e.preventDefault(); doRefresh(); }
     }
 
@@ -666,6 +675,14 @@
       month: 'short', day: 'numeric',
       hour: '2-digit', minute: '2-digit', second: '2-digit',
     });
+  }
+
+  function fmtAgo(ts) {
+    var s = Math.floor((Date.now() - ts) / 1000);
+    if (s < 5) return 'just now';
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    return Math.floor(s / 3600) + 'h ago';
   }
 
   window.fmtDuration = function (ms) {

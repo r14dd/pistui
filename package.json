@@ -1,0 +1,12 @@
+{
+  "name": "pistui-frontend",
+  "private": true,
+  "description": "Lint tooling for pistui's embedded static assets",
+  "scripts": {
+    "lint": "eslint static"
+  },
+  "devDependencies": {
+    "eslint": "^9.16.0",
+    "globals": "^15.13.0"
+  }
+}

@@ -104,14 +104,19 @@ pub struct SpanNode {
     pub start_time: String,
     pub end_time: Option<String>,
     pub duration_ms: Option<f64>,
+    pub ttft_ms: Option<f64>,
     pub status: SpanStatus,
     pub status_message: Option<String>,
     pub model: Option<String>,
     pub input: Option<serde_json::Value>,
     pub output: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
+    pub tokens_total: Option<u64>,
     pub cost: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scores: Vec<Score>,
     pub children: Vec<SpanNode>,
 }
 
@@ -134,6 +139,8 @@ pub struct TraceStats {
     pub event_count: usize,
     pub error_count: usize,
     pub deepest_nesting: usize,
+    pub orphan_count: usize,
+    pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_breakdown: Vec<ModelStats>,
 }
@@ -188,6 +195,9 @@ pub enum Error {
 
     #[error("rate limited - try again shortly")]
     RateLimit,
+
+    #[error("upstream error: {0}")]
+    Upstream(String),
 
     #[error("explanation failed: {0}")]
     Explain(String),

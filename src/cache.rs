@@ -6,6 +6,8 @@ use crate::langfuse;
 use crate::model::{Result, Score, SpanNode, Trace, TraceStats};
 use crate::parser;
 
+const MAX_OBSERVATIONS: usize = 2000;
+
 struct CacheState {
     traces: Vec<Trace>,
     details: HashMap<String, CachedDetail>,
@@ -74,11 +76,18 @@ impl TraceCache {
         }
 
         let trace = self.client.get_trace(trace_id).await?;
-        let (observations, scores) = tokio::try_join!(
+        let (mut observations, scores) = tokio::try_join!(
             self.client.get_observations(trace_id),
             self.client.get_scores(trace_id),
         )?;
-        let (tree, stats) = parser::build_tree(&observations);
+
+        let truncated = observations.len() > MAX_OBSERVATIONS;
+        if truncated {
+            observations.truncate(MAX_OBSERVATIONS);
+        }
+
+        let (tree, mut stats) = parser::build_tree(&observations, &scores);
+        stats.truncated = truncated;
 
         let detail = CachedDetail {
             trace: trace.clone(),
@@ -162,7 +171,7 @@ mod tests {
                     { "id": "t-1", "timestamp": "2026-06-14T10:00:00.000Z" }
                 ]),
             )))
-            .expect(1) // only one HTTP call, even though we read twice
+            .expect(1)
             .mount(&mock)
             .await;
 
@@ -180,7 +189,7 @@ mod tests {
     async fn mount_scores_empty(mock: &MockServer, trace_id: &str) {
         Mock::given(method("GET"))
             .and(path("/api/public/scores"))
-            .and(query_param("traceid", trace_id))
+            .and(query_param("traceId", trace_id))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(scores_json(serde_json::json!([]))),
             )
@@ -225,6 +234,7 @@ mod tests {
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].name, "root");
         assert_eq!(stats.span_count, 1);
+        assert!(!stats.truncated);
     }
 
     #[tokio::test]
@@ -250,7 +260,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/public/scores"))
-            .and(query_param("traceid", "t-1"))
+            .and(query_param("traceId", "t-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(scores_json(
                 serde_json::json!([
                     {
@@ -423,5 +433,56 @@ mod tests {
         let traces = cache.traces().await;
         assert_eq!(traces.len(), 101);
         assert_eq!(traces[100].id, "t-100");
+    }
+
+    async fn mount_observation_pages(mock: &MockServer, trace_id: &str, page_sizes: &[usize]) {
+        for (i, &size) in page_sizes.iter().enumerate() {
+            let page = (i + 1) as u32;
+            let obs: Vec<serde_json::Value> = (0..size)
+                .map(|j| {
+                    serde_json::json!({
+                        "id": format!("obs-{page}-{j}"),
+                        "traceId": trace_id,
+                        "type": "SPAN",
+                        "name": "span",
+                        "startTime": "2026-06-14T10:00:00.000Z",
+                        "endTime": "2026-06-14T10:00:01.000Z"
+                    })
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path("/api/public/observations"))
+                .and(query_param("traceId", trace_id))
+                .and(query_param("page", page.to_string()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(observations_json(serde_json::json!(obs))),
+                )
+                .mount(mock)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_detail_truncates_large_observation_sets() {
+        let (cache, mock) = setup().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/traces/t-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "t-1", "timestamp": "2026-06-14T10:00:00.000Z"
+            })))
+            .mount(&mock)
+            .await;
+
+        let mut sizes = vec![100usize; MAX_OBSERVATIONS / 100];
+        sizes.push(1);
+        mount_observation_pages(&mock, "t-1", &sizes).await;
+        mount_scores_empty(&mock, "t-1").await;
+
+        let (_trace, tree, stats, _scores) = cache.trace_detail("t-1").await.unwrap();
+        assert!(stats.truncated);
+        assert_eq!(tree.len(), MAX_OBSERVATIONS);
+        assert_eq!(stats.span_count, MAX_OBSERVATIONS);
     }
 }

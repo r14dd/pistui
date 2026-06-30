@@ -215,7 +215,7 @@ async fn get_trace_returns_tree_and_stats() {
 
     Mock::given(method("GET"))
         .and(path("/api/public/scores"))
-        .and(query_param("traceid", "t-abc"))
+        .and(query_param("traceId", "t-abc"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
         .mount(&mock)
         .await;
@@ -281,7 +281,7 @@ async fn get_trace_with_no_observations() {
 
     Mock::given(method("GET"))
         .and(path("/api/public/scores"))
-        .and(query_param("traceid", "t-empty"))
+        .and(query_param("traceId", "t-empty"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
         .mount(&mock)
         .await;
@@ -320,7 +320,7 @@ async fn export_returns_json_attachment() {
 
     Mock::given(method("GET"))
         .and(path("/api/public/scores"))
-        .and(query_param("traceid", "t-exp"))
+        .and(query_param("traceId", "t-exp"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
         .mount(&mock)
         .await;
@@ -366,7 +366,7 @@ async fn trace_detail_includes_scores() {
 
     Mock::given(method("GET"))
         .and(path("/api/public/scores"))
-        .and(query_param("traceid", "t-scored"))
+        .and(query_param("traceId", "t-scored"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": [
                 { "id": "s-1", "traceId": "t-scored", "name": "accuracy", "value": 0.9 },
@@ -410,7 +410,7 @@ async fn trace_detail_omits_scores_when_empty() {
 
     Mock::given(method("GET"))
         .and(path("/api/public/scores"))
-        .and(query_param("traceid", "t-no-scores"))
+        .and(query_param("traceId", "t-no-scores"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
         .mount(&mock)
         .await;
@@ -465,7 +465,7 @@ async fn trace_detail_includes_model_breakdown() {
 
     Mock::given(method("GET"))
         .and(path("/api/public/scores"))
-        .and(query_param("traceid", "t-models"))
+        .and(query_param("traceId", "t-models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
         .mount(&mock)
         .await;
@@ -504,7 +504,7 @@ async fn config_with_explain() {
     let mock = MockServer::start().await;
     let client = langfuse::Client::with_base_url(mock.uri());
     let cache = Arc::new(TraceCache::new(client));
-    let explain = pistui::explain::ExplainClient::new("key", "http://localhost", "model");
+    let explain = pistui::explain::ExplainClient::new("key", "http://localhost", "model").unwrap();
     let app = router(cache, Some(explain));
 
     let resp = app.oneshot(get("/api/config")).await.unwrap();
@@ -543,7 +543,7 @@ async fn explain_with_request_key() {
 
     Mock::given(method("GET"))
         .and(path("/api/public/scores"))
-        .and(query_param("traceid", "t-1"))
+        .and(query_param("traceId", "t-1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
         .mount(&langfuse_mock)
         .await;
@@ -810,5 +810,141 @@ async fn langfuse_500_on_refresh_returns_bad_gateway() {
         .await;
 
     let resp = app.oneshot(post("/api/refresh")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn langfuse_429_on_trace_detail_returns_too_many_requests() {
+    let (app, mock) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/traces/t-429"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&mock)
+        .await;
+
+    let resp = app.oneshot(get("/api/traces/t-429")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+async fn mount_trace_detail(mock: &MockServer, trace_id: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/public/traces/{trace_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": trace_id, "name": "test", "timestamp": "2026-06-14T10:00:00.000Z"
+        })))
+        .mount(mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/observations"))
+        .and(query_param("traceId", trace_id))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/public/scores"))
+        .and(query_param("traceId", trace_id))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn explain_falls_back_to_env_client() {
+    let langfuse_mock = MockServer::start().await;
+    let llm_mock = MockServer::start().await;
+
+    mount_trace_detail(&langfuse_mock, "t-1").await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{ "message": { "content": "env explained." } }]
+        })))
+        .mount(&llm_mock)
+        .await;
+
+    let client = langfuse::Client::with_base_url(langfuse_mock.uri());
+    let cache = Arc::new(TraceCache::new(client));
+    let explain =
+        pistui::explain::ExplainClient::new("env-key", &llm_mock.uri(), "gpt-4o-mini").unwrap();
+    let app = router(cache, Some(explain));
+
+    let resp = app.oneshot(post("/api/traces/t-1/explain")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(data["explanation"], "env explained.");
+}
+
+#[tokio::test]
+async fn explain_forwards_custom_prompt() {
+    let langfuse_mock = MockServer::start().await;
+    let llm_mock = MockServer::start().await;
+
+    mount_trace_detail(&langfuse_mock, "t-1").await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{ "message": { "content": "ok" } }]
+        })))
+        .mount(&llm_mock)
+        .await;
+
+    let client = langfuse::Client::with_base_url(langfuse_mock.uri());
+    let cache = Arc::new(TraceCache::new(client));
+    let app = router(cache, None);
+
+    let req = post_json(
+        "/api/traces/t-1/explain",
+        serde_json::json!({
+            "api_key": "k",
+            "base_url": llm_mock.uri(),
+            "prompt": "explain in French"
+        }),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let received = llm_mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let body = String::from_utf8_lossy(&received[0].body);
+    assert!(
+        body.contains("explain in French"),
+        "custom prompt not forwarded to LLM: {body}"
+    );
+}
+
+#[tokio::test]
+async fn explain_maps_llm_failure_to_bad_gateway() {
+    let langfuse_mock = MockServer::start().await;
+    let llm_mock = MockServer::start().await;
+
+    mount_trace_detail(&langfuse_mock, "t-1").await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("model overloaded"))
+        .mount(&llm_mock)
+        .await;
+
+    let client = langfuse::Client::with_base_url(langfuse_mock.uri());
+    let cache = Arc::new(TraceCache::new(client));
+    let app = router(cache, None);
+
+    let req = post_json(
+        "/api/traces/t-1/explain",
+        serde_json::json!({
+            "api_key": "k",
+            "base_url": llm_mock.uri()
+        }),
+    );
+    let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
