@@ -36,8 +36,6 @@
   window.renderExplainButton = function (container, traceId) {
     var wrapper = el('div', 'explain-section');
 
-    var config = loadConfig();
-
     var promptInput = el('input', 'explain-prompt');
     promptInput.type = 'text';
     promptInput.placeholder = 'focus on errors, explain in Spanish, why so expensive…';
@@ -54,19 +52,29 @@
     });
     wrapper.appendChild(btn);
 
-    if (config) {
-      var provider = PROVIDERS.find(function (p) { return p.id === config.providerId; });
-      var label = (provider ? provider.name : 'Custom') + ' / ' + config.model;
-      var settings = el('span', 'explain-settings-link', label);
-      settings.title = 'Change LLM settings';
-      settings.addEventListener('click', function () {
-        showProviderPicker(wrapper, traceId);
-      });
-      wrapper.appendChild(settings);
-    }
+    var settings = el('span', 'explain-settings-link');
+    settings.title = 'Change LLM settings';
+    settings.addEventListener('click', function () {
+      showProviderPicker(wrapper, traceId);
+    });
+    wrapper.appendChild(settings);
+    updateSettingsLink(wrapper);
 
     container.appendChild(wrapper);
   };
+
+  function updateSettingsLink(wrapper) {
+    var link = wrapper.querySelector('.explain-settings-link');
+    if (!link) return;
+    var config = loadConfig();
+    if (!config) {
+      link.style.display = 'none';
+      return;
+    }
+    var provider = PROVIDERS.find(function (p) { return p.id === config.providerId; });
+    link.textContent = (provider ? provider.name : 'Custom') + ' / ' + config.model;
+    link.style.display = '';
+  }
 
   function showProviderPicker(wrapper, traceId) {
     var existing = wrapper.querySelector('.explain-picker');
@@ -183,8 +191,10 @@
       }
 
       saveConfig(config);
+      updateSettingsLink(wrapper);
       picker.remove();
-      runExplain(wrapper, traceId, config);
+      var pi = wrapper.querySelector('.explain-prompt');
+      runExplain(wrapper, traceId, config, pi ? pi.value.trim() : '');
     });
     actions.appendChild(saveBtn);
 
@@ -231,6 +241,7 @@
         var errMsg = body.error || resp.statusText;
         if (resp.status === 400) {
           clearConfig();
+          updateSettingsLink(wrapper);
         }
         throw new Error(errMsg);
       }
