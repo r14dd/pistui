@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use tokio::sync::RwLock;
 
@@ -7,10 +7,12 @@ use crate::model::{Result, Score, SpanNode, Trace, TraceStats};
 use crate::parser;
 
 const MAX_OBSERVATIONS: usize = 2000;
+const MAX_DETAIL_ENTRIES: usize = 200;
 
 struct CacheState {
     traces: Vec<Trace>,
     details: HashMap<String, CachedDetail>,
+    detail_order: VecDeque<String>,
 }
 
 #[derive(Clone)]
@@ -24,16 +26,23 @@ struct CachedDetail {
 pub struct TraceCache {
     client: langfuse::Client,
     state: RwLock<CacheState>,
+    max_details: usize,
 }
 
 impl TraceCache {
     pub fn new(client: langfuse::Client) -> Self {
+        Self::with_max_details(client, MAX_DETAIL_ENTRIES)
+    }
+
+    fn with_max_details(client: langfuse::Client, max_details: usize) -> Self {
         Self {
             client,
             state: RwLock::new(CacheState {
                 traces: Vec::new(),
                 details: HashMap::new(),
+                detail_order: VecDeque::new(),
             }),
+            max_details,
         }
     }
 
@@ -52,6 +61,7 @@ impl TraceCache {
         let mut state = self.state.write().await;
         state.traces = all;
         state.details.clear();
+        state.detail_order.clear();
         Ok(())
     }
 
@@ -64,14 +74,10 @@ impl TraceCache {
         trace_id: &str,
     ) -> Result<(Trace, Vec<SpanNode>, TraceStats, Vec<Score>)> {
         {
-            let state = self.state.read().await;
-            if let Some(d) = state.details.get(trace_id) {
-                return Ok((
-                    d.trace.clone(),
-                    d.tree.clone(),
-                    d.stats.clone(),
-                    d.scores.clone(),
-                ));
+            let mut state = self.state.write().await;
+            if let Some(d) = state.details.get(trace_id).cloned() {
+                touch(&mut state.detail_order, trace_id);
+                return Ok((d.trace, d.tree, d.stats, d.scores));
             }
         }
 
@@ -95,11 +101,19 @@ impl TraceCache {
             stats: stats.clone(),
             scores: scores.clone(),
         };
-        self.state
-            .write()
-            .await
-            .details
-            .insert(trace_id.to_string(), detail);
+        {
+            let mut state = self.state.write().await;
+            state.details.insert(trace_id.to_string(), detail);
+            touch(&mut state.detail_order, trace_id);
+            while state.details.len() > self.max_details {
+                match state.detail_order.pop_front() {
+                    Some(old) => {
+                        state.details.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+        }
 
         Ok((trace, tree, stats, scores))
     }
@@ -107,6 +121,13 @@ impl TraceCache {
     pub async fn refresh(&self) -> Result<()> {
         self.warm().await
     }
+}
+
+fn touch(order: &mut VecDeque<String>, id: &str) {
+    if let Some(pos) = order.iter().position(|x| x == id) {
+        order.remove(pos);
+    }
+    order.push_back(id.to_string());
 }
 
 #[cfg(test)]
@@ -484,5 +505,50 @@ mod tests {
         assert!(stats.truncated);
         assert_eq!(tree.len(), MAX_OBSERVATIONS);
         assert_eq!(stats.span_count, MAX_OBSERVATIONS);
+    }
+
+    #[tokio::test]
+    async fn detail_cache_evicts_least_recently_used() {
+        let mock = MockServer::start().await;
+        let client = langfuse::Client::with_base_url(mock.uri());
+        let cache = TraceCache::with_max_details(client, 2);
+
+        for id in ["t-1", "t-2", "t-3"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/public/traces/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id, "timestamp": "2026-06-14T10:00:00.000Z"
+                })))
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/public/observations"))
+                .and(query_param("traceId", id))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(observations_json(serde_json::json!([]))),
+                )
+                .mount(&mock)
+                .await;
+            mount_scores_empty(&mock, id).await;
+        }
+
+        cache.trace_detail("t-1").await.unwrap();
+        cache.trace_detail("t-2").await.unwrap();
+        cache.trace_detail("t-1").await.unwrap();
+        cache.trace_detail("t-3").await.unwrap();
+        cache.trace_detail("t-2").await.unwrap();
+
+        let received = mock.received_requests().await.unwrap();
+        let t2_calls = received
+            .iter()
+            .filter(|r| r.url.path() == "/api/public/traces/t-2")
+            .count();
+        let t1_calls = received
+            .iter()
+            .filter(|r| r.url.path() == "/api/public/traces/t-1")
+            .count();
+        assert_eq!(t2_calls, 2);
+        assert_eq!(t1_calls, 1);
     }
 }
