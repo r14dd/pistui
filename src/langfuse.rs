@@ -7,7 +7,13 @@ use crate::model::{Error, Observation, Result, Score, Trace};
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
+    max_retries: u32,
+    base_delay: Duration,
 }
+
+const MAX_RETRIES: u32 = 3;
+const BASE_DELAY: Duration = Duration::from_millis(300);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(serde::Deserialize)]
 struct PagedResponse<T> {
@@ -37,7 +43,12 @@ impl Client {
             .build()?;
 
         let base_url = host.trim_end_matches('/').to_string();
-        Ok(Self { http, base_url })
+        Ok(Self {
+            http,
+            base_url,
+            max_retries: MAX_RETRIES,
+            base_delay: BASE_DELAY,
+        })
     }
 
     #[doc(hidden)]
@@ -45,38 +56,50 @@ impl Client {
         Self {
             http: reqwest::Client::new(),
             base_url,
+            max_retries: MAX_RETRIES,
+            base_delay: Duration::ZERO,
         }
     }
 
     pub async fn list_traces(&self, limit: u32, page: u32) -> Result<Vec<Trace>> {
-        let url = format!(
-            "{}/api/public/traces?limit={limit}&page={page}",
-            self.base_url
-        );
-        let resp = self.http.get(&url).send().await?;
-        let resp = map_status(resp).await?;
+        let url = format!("{}/api/public/traces", self.base_url);
+        let resp = self
+            .send_retrying(|| {
+                self.http
+                    .get(&url)
+                    .query(&[("limit", limit.to_string()), ("page", page.to_string())])
+            })
+            .await?;
         let paged: PagedResponse<Trace> =
             resp.json().await.map_err(|e| Error::Parse(e.to_string()))?;
         Ok(paged.data)
     }
 
     pub async fn get_trace(&self, trace_id: &str) -> Result<Trace> {
-        let url = format!("{}/api/public/traces/{trace_id}", self.base_url);
-        let resp = self.http.get(&url).send().await?;
-        let resp = map_status(resp).await?;
+        let mut url = reqwest::Url::parse(&format!("{}/api/public/traces", self.base_url))
+            .map_err(|e| Error::Parse(e.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| Error::Parse("invalid Langfuse base URL".into()))?
+            .push(trace_id);
+        let resp = self.send_retrying(|| self.http.get(url.clone())).await?;
         resp.json().await.map_err(|e| Error::Parse(e.to_string()))
     }
 
     pub async fn get_observations(&self, trace_id: &str) -> Result<Vec<Observation>> {
+        let url = format!("{}/api/public/observations", self.base_url);
         let mut all = Vec::new();
         let mut page = 1u32;
         loop {
-            let url = format!(
-                "{}/api/public/observations?traceId={trace_id}&limit=100&page={page}",
-                self.base_url
-            );
-            let resp = self.http.get(&url).send().await?;
-            let resp = map_status(resp).await?;
+            let page_str = page.to_string();
+            let resp = self
+                .send_retrying(|| {
+                    self.http.get(&url).query(&[
+                        ("traceId", trace_id),
+                        ("limit", "100"),
+                        ("page", page_str.as_str()),
+                    ])
+                })
+                .await?;
             let paged: PagedResponse<Observation> =
                 resp.json().await.map_err(|e| Error::Parse(e.to_string()))?;
             let count = paged.data.len();
@@ -90,15 +113,20 @@ impl Client {
     }
 
     pub async fn get_scores(&self, trace_id: &str) -> Result<Vec<Score>> {
+        let url = format!("{}/api/public/scores", self.base_url);
         let mut all = Vec::new();
         let mut page = 1u32;
         loop {
-            let url = format!(
-                "{}/api/public/scores?traceId={trace_id}&limit=100&page={page}",
-                self.base_url
-            );
-            let resp = self.http.get(&url).send().await?;
-            let resp = map_status(resp).await?;
+            let page_str = page.to_string();
+            let resp = self
+                .send_retrying(|| {
+                    self.http.get(&url).query(&[
+                        ("traceId", trace_id),
+                        ("limit", "100"),
+                        ("page", page_str.as_str()),
+                    ])
+                })
+                .await?;
             let paged: PagedResponse<Score> =
                 resp.json().await.map_err(|e| Error::Parse(e.to_string()))?;
             let count = paged.data.len();
@@ -110,6 +138,56 @@ impl Client {
         }
         Ok(all)
     }
+
+    async fn send_retrying<F>(&self, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let mut attempt = 0u32;
+        loop {
+            match build().send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let retryable = status == 429 || (500..=599).contains(&status);
+                    if retryable && attempt < self.max_retries {
+                        let delay = retry_after(&resp).unwrap_or_else(|| self.backoff(attempt));
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return map_status(resp).await;
+                }
+                Err(e) => {
+                    if attempt < self.max_retries && (e.is_timeout() || e.is_connect()) {
+                        tokio::time::sleep(self.backoff(attempt)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
+    fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+        self.base_delay
+            .checked_mul(factor)
+            .unwrap_or(MAX_RETRY_DELAY)
+            .min(MAX_RETRY_DELAY)
+    }
+}
+
+fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    let secs = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_DELAY))
 }
 
 async fn map_status(resp: reqwest::Response) -> Result<reqwest::Response> {
@@ -415,5 +493,48 @@ mod tests {
         let scores = client.get_scores("trace-1").await.unwrap();
         assert_eq!(scores.len(), 101);
         assert_eq!(scores[100].id, "s-last");
+    }
+
+    #[tokio::test]
+    async fn retries_transient_5xx_then_succeeds() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/traces"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/traces"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri());
+        let traces = client.list_traces(50, 1).await.unwrap();
+        assert!(traces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_exhausting_retries() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/traces"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1 + MAX_RETRIES as u64)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri());
+        let err = client.list_traces(50, 1).await.unwrap_err();
+        assert!(matches!(err, Error::Upstream(_)));
     }
 }
