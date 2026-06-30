@@ -11,6 +11,8 @@
   var listLoadedAt = null;
   var comparing = false;
   var compareSelection = [];
+  var autoRefresh = false;
+  var autoRefreshInterval = 10000;
 
   window.addEventListener('hashchange', route);
   document.addEventListener('DOMContentLoaded', init);
@@ -64,7 +66,7 @@
       listLoadedAt = Date.now();
       renderList();
     } catch (e) {
-      app.innerHTML = '<div class="error-msg">failed to load traces: ' + esc(e.message) + '</div>';
+      app.innerHTML = '<div class="error-msg" role="alert">failed to load traces: ' + esc(e.message) + '</div>';
     }
   }
 
@@ -80,7 +82,7 @@
       var sessions = await resp.json();
       renderSessions(sessions);
     } catch (e) {
-      app.innerHTML = '<div class="error-msg">' + esc(e.message) + '</div>';
+      app.innerHTML = '<div class="error-msg" role="alert">' + esc(e.message) + '</div>';
     }
   }
 
@@ -98,6 +100,7 @@
 
     if (sessions.length === 0) {
       var empty = el('div', 'empty-state');
+      empty.setAttribute('role', 'status');
       empty.textContent = 'no sessions found - traces without a session_id are not grouped';
       app.appendChild(empty);
       return;
@@ -163,6 +166,40 @@
     return toggle;
   }
 
+  function buildAutoRefresh() {
+    var wrap = el('label', 'auto-refresh');
+    wrap.title = 'Poll Langfuse for new traces on an interval';
+
+    var check = el('input');
+    check.type = 'checkbox';
+    check.checked = autoRefresh;
+    wrap.appendChild(check);
+    wrap.appendChild(document.createTextNode(' auto'));
+
+    var select = el('select', 'auto-refresh-interval');
+    [[5000, '5s'], [10000, '10s'], [30000, '30s'], [60000, '1m']].forEach(function (opt) {
+      var o = el('option', null, opt[1]);
+      o.value = String(opt[0]);
+      select.appendChild(o);
+    });
+    select.value = String(autoRefreshInterval);
+    select.disabled = !autoRefresh;
+    wrap.appendChild(select);
+
+    check.addEventListener('change', function () {
+      autoRefresh = check.checked;
+      select.disabled = !autoRefresh;
+      if (autoRefresh) startAutoRefresh(autoRefreshInterval);
+      else stopAutoRefresh();
+    });
+    select.addEventListener('change', function () {
+      autoRefreshInterval = parseInt(select.value, 10);
+      if (autoRefresh) startAutoRefresh(autoRefreshInterval);
+    });
+
+    return wrap;
+  }
+
   function renderList() {
     var filtered = traces.filter(function (t) {
       if (!filterText) return true;
@@ -221,6 +258,8 @@
     refreshBtn.addEventListener('click', doRefresh);
     bar.appendChild(refreshBtn);
 
+    bar.appendChild(buildAutoRefresh());
+
     if (listLoadedAt) {
       var stale = el('span', 'staleness', 'loaded ' + fmtAgo(listLoadedAt));
       stale.title = new Date(listLoadedAt).toLocaleString();
@@ -231,6 +270,7 @@
 
     if (sorted.length === 0) {
       var empty = el('div', 'empty-state');
+      empty.setAttribute('role', 'status');
       if (filterText) {
         empty.textContent = 'no traces match "' + filterText + '"';
         var clearLink = el('span', 'empty-action', ' - clear filter');
@@ -362,7 +402,8 @@
     if (row) row.click();
   }
 
-  async function doRefresh() {
+  async function doRefresh(opts) {
+    var quiet = opts && opts.quiet === true;
     var btn = document.querySelector('.refresh-btn');
     if (btn) {
       btn.disabled = true;
@@ -375,11 +416,11 @@
         var body = await resp.json().catch(function () { return {}; });
         throw new Error(body.error || resp.statusText);
       }
-      selectedTraceId = null;
+      if (!quiet) selectedTraceId = null;
       await showList();
     } catch (e) {
       var app = document.getElementById('app');
-      app.innerHTML = '<div class="error-msg">refresh failed: ' + esc(e.message) + '</div>';
+      app.innerHTML = '<div class="error-msg" role="alert">refresh failed: ' + esc(e.message) + '</div>';
     } finally {
       if (btn) {
         btn.disabled = false;
@@ -390,7 +431,7 @@
 
   async function showTrace(traceId) {
     var app = document.getElementById('app');
-    app.innerHTML = '<div class="loading">loading trace…</div>';
+    app.innerHTML = '<div class="loading" role="status" aria-live="polite">loading trace…</div>';
 
     try {
       var resp = await fetch('/api/traces/' + encodeURIComponent(traceId));
@@ -401,7 +442,7 @@
       var data = await resp.json();
       window.renderTraceDetail(app, data);
     } catch (e) {
-      app.innerHTML = '<div class="error-msg">failed to load trace: ' + esc(e.message) + '</div>';
+      app.innerHTML = '<div class="error-msg" role="alert">failed to load trace: ' + esc(e.message) + '</div>';
     }
   }
 
@@ -419,11 +460,11 @@
     var grid = el('div', 'compare-grid');
 
     var colA = el('div', 'compare-col');
-    colA.innerHTML = '<div class="loading">loading…</div>';
+    colA.innerHTML = '<div class="loading" role="status" aria-live="polite">loading…</div>';
     grid.appendChild(colA);
 
     var colB = el('div', 'compare-col');
-    colB.innerHTML = '<div class="loading">loading…</div>';
+    colB.innerHTML = '<div class="loading" role="status" aria-live="polite">loading…</div>';
     grid.appendChild(colB);
 
     app.appendChild(grid);
@@ -438,7 +479,7 @@
       dataA = await respA.json();
       dataB = await respB.json();
     } catch (e) {
-      app.innerHTML = '<div class="error-msg">' + esc(e.message) + '</div>';
+      app.innerHTML = '<div class="error-msg" role="alert">' + esc(e.message) + '</div>';
       return;
     }
 
@@ -519,16 +560,43 @@
 
   // --- help overlay ---
 
-  function toggleHelp() {
-    var existing = document.querySelector('.help-overlay');
-    if (existing) { existing.remove(); return; }
+  var helpReturnFocus = null;
 
+  function closeHelp() {
+    var overlay = document.querySelector('.help-overlay');
+    if (overlay) overlay.remove();
+    if (helpReturnFocus) helpReturnFocus.focus();
+    helpReturnFocus = null;
+  }
+
+  function toggleHelp() {
+    if (document.querySelector('.help-overlay')) { closeHelp(); return; }
+
+    helpReturnFocus = document.activeElement;
     var overlay = el('div', 'help-overlay');
     overlay.addEventListener('click', function (e) {
-      if (e.target === overlay) overlay.remove();
+      if (e.target === overlay) closeHelp();
+    });
+    overlay.addEventListener('keydown', function (e) {
+      if (e.key !== 'Tab') return;
+      var focusable = panel.querySelectorAll('button, a[href], [tabindex]:not([tabindex="-1"])');
+      if (focusable.length === 0) { e.preventDefault(); return; }
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     });
 
     var panel = el('div', 'help-panel');
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-label', 'keyboard shortcuts');
+    panel.tabIndex = -1;
     panel.appendChild(el('h2', null, 'keyboard shortcuts'));
 
     var sections = [
@@ -571,11 +639,12 @@
     });
 
     var closeBtn = el('button', 'btn help-close', 'close');
-    closeBtn.addEventListener('click', function () { overlay.remove(); });
+    closeBtn.addEventListener('click', closeHelp);
     panel.appendChild(closeBtn);
 
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
+    closeBtn.focus();
   }
 
   // --- auto-refresh ---
@@ -586,7 +655,10 @@
     stopAutoRefresh();
     autoRefreshTimer = setInterval(function () {
       var onList = !location.hash || location.hash === '#/' || location.hash === '#';
-      if (onList) doRefresh();
+      if (!onList) return;
+      var active = document.activeElement;
+      if (active && active.classList.contains('filter-input')) return;
+      doRefresh({ quiet: true });
     }, intervalMs);
   }
 
@@ -616,7 +688,7 @@
 
     var helpOpen = document.querySelector('.help-overlay');
     if (helpOpen) {
-      if (e.key === 'Escape') { helpOpen.remove(); e.preventDefault(); }
+      if (e.key === 'Escape') { closeHelp(); e.preventDefault(); }
       return;
     }
 

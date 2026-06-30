@@ -8,7 +8,7 @@
   --border-subtle: #161c28;
   --text: #dce3ed;
   --text-muted: #7a859a;
-  --text-subtle: #4a5568;
+  --text-subtle: #74808f;
   --accent: #4c9aff;
   --accent-glow: rgba(76, 154, 255, 0.25);
   --accent-soft: rgba(76, 154, 255, 0.08);
@@ -1408,6 +1408,37 @@ main {
   font-size: 11px;
   color: var(--text-subtle);
   margin-left: 4px;
+  cursor: default;
+}
+
+.auto-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.auto-refresh input {
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.auto-refresh-interval {
+  padding: 4px 6px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.auto-refresh-interval:disabled {
+  opacity: 0.35;
   cursor: default;
 }
 
