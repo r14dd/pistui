@@ -179,14 +179,16 @@ impl Client {
 }
 
 fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    let secs = resp
+    let value = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
         .ok()?;
+    parse_retry_after(value)
+}
+
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let secs = value.trim().parse::<u64>().ok()?;
     Some(Duration::from_secs(secs).min(MAX_RETRY_DELAY))
 }
 
@@ -536,5 +538,70 @@ mod tests {
         let client = Client::with_base_url(server.uri());
         let err = client.list_traces(50, 1).await.unwrap_err();
         assert!(matches!(err, Error::Upstream(_)));
+    }
+
+    #[tokio::test]
+    async fn retries_on_429_then_succeeds() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/traces"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/traces"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri());
+        let traces = client.list_traces(50, 1).await.unwrap();
+        assert!(traces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_trace_percent_encodes_id() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "id": "a/b c",
+            "name": "chat",
+            "timestamp": "2026-06-10T14:00:00.000Z"
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/public/traces/a%2Fb%20c"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::with_base_url(server.uri());
+        let trace = client.get_trace("a/b c").await.unwrap();
+        assert_eq!(trace.id, "a/b c");
+    }
+
+    #[test]
+    fn parse_retry_after_reads_seconds() {
+        assert_eq!(parse_retry_after("3"), Some(Duration::from_secs(3)));
+        assert_eq!(parse_retry_after("  5 "), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_non_numeric() {
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+    }
+
+    #[test]
+    fn parse_retry_after_caps_at_max() {
+        assert_eq!(parse_retry_after("100"), Some(MAX_RETRY_DELAY));
     }
 }
