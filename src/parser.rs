@@ -17,7 +17,6 @@ pub fn build_tree(observations: &[Observation], scores: &[Score]) -> (Vec<SpanNo
         group.sort_by(|a, b| a.start_time.cmp(&b.start_time));
     }
 
-    // Build score lookup by observation_id
     let mut score_map: HashMap<&str, Vec<&Score>> = HashMap::new();
     for score in scores {
         if let Some(obs_id) = score.observation_id.as_deref() {
@@ -37,7 +36,6 @@ pub fn build_tree(observations: &[Observation], scores: &[Score]) -> (Vec<SpanNo
         }
     }
 
-    // Sort all roots by start time
     roots.sort_by(|a, b| a.start_time.cmp(&b.start_time));
 
     let mut stats = compute_stats(&roots, observations);
