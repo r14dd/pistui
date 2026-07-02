@@ -33,16 +33,27 @@ struct ChoiceMessage {
 
 impl ExplainClient {
     pub fn new(api_key: &str, base_url: &str, model: &str) -> Result<Self> {
+        let base_url = base_url.trim_end_matches('/');
+        let parsed = reqwest::Url::parse(base_url)
+            .map_err(|e| Error::Explain(format!("invalid base URL: {e}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(Error::Explain(format!(
+                "unsupported base URL scheme '{}': only http and https are allowed",
+                parsed.scheme()
+            )));
+        }
+
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent("pistui")
             .build()
             .map_err(|e| Error::Explain(format!("failed to build HTTP client: {e}")))?;
 
         Ok(Self {
             http,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: base_url.to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
         })
@@ -386,6 +397,19 @@ mod tests {
         }
         let prompt = build_prompt(&sample_trace(), &tree, &sample_stats());
         assert!(prompt.contains("spans omitted"));
+    }
+
+    #[test]
+    fn rejects_non_http_scheme() {
+        match ExplainClient::new("k", "file:///etc/passwd", "m") {
+            Err(Error::Explain(msg)) => assert!(msg.contains("scheme")),
+            _ => panic!("expected non-http scheme to be rejected"),
+        }
+    }
+
+    #[test]
+    fn rejects_base_url_without_scheme() {
+        assert!(ExplainClient::new("k", "api.example.com/v1", "m").is_err());
     }
 
     #[tokio::test]
