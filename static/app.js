@@ -224,6 +224,10 @@
     });
 
     var app = document.getElementById('app');
+    var active = document.activeElement;
+    var filterFocused = active && active.classList.contains('filter-input');
+    var caretStart = filterFocused ? active.selectionStart : 0;
+    var caretEnd = filterFocused ? active.selectionEnd : 0;
     app.innerHTML = '';
 
     var bar = el('div', 'filter-bar');
@@ -267,6 +271,11 @@
     }
 
     app.appendChild(bar);
+
+    if (filterFocused) {
+      input.focus();
+      input.setSelectionRange(caretStart, caretEnd);
+    }
 
     if (sorted.length === 0) {
       var empty = el('div', 'empty-state');
