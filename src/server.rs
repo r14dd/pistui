@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -45,6 +46,28 @@ pub fn router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/refresh", post(refresh))
         .with_state(state)
         .fallback(static_handler)
+        .layer(middleware::from_fn(guard_local_host))
+}
+
+// A browser reaching pistui through DNS rebinding still sends the attacker's
+// domain in the Host header, so rejecting anything but a loopback authority
+// keeps a malicious page from reading cached traces or driving /explain.
+async fn guard_local_host(req: Request, next: Next) -> Response {
+    if let Some(host) = req.headers().get(header::HOST) {
+        let allowed = host.to_str().map(is_loopback_authority).unwrap_or(false);
+        if !allowed {
+            return (StatusCode::FORBIDDEN, "forbidden: non-local Host header").into_response();
+        }
+    }
+    next.run(req).await
+}
+
+fn is_loopback_authority(value: &str) -> bool {
+    let host = match value.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => value.split(':').next().unwrap_or(value),
+    };
+    matches!(host, "127.0.0.1" | "::1") || host.eq_ignore_ascii_case("localhost")
 }
 
 // Lean summary for the list view — excludes large input/output blobs.
