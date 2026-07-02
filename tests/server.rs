@@ -110,6 +110,32 @@ async fn unknown_path_falls_back_to_index() {
     assert!(html.contains("<title>pistui</title>"));
 }
 
+// --- Host-header guard (anti DNS-rebinding) ---
+
+#[tokio::test]
+async fn rejects_non_local_host_header() {
+    let (app, _mock) = setup().await;
+    let req = Request::builder()
+        .uri("/api/traces")
+        .header("host", "evil.example.com")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn allows_loopback_host_header() {
+    let (app, _mock) = setup().await;
+    let req = Request::builder()
+        .uri("/api/traces")
+        .header("host", "localhost:9922")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 // --- GET /api/traces (served from cache) ---
 
 #[tokio::test]
@@ -647,8 +673,8 @@ async fn config_omits_null_fields() {
         .unwrap();
     let data: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(data["explain"], false);
-    assert!(data.get("langfuseHost").is_none() || data["langfuseHost"].is_null());
-    assert!(data.get("focusTrace").is_none() || data["focusTrace"].is_null());
+    assert!(data.get("langfuseHost").is_none());
+    assert!(data.get("focusTrace").is_none());
 }
 
 // --- GET /api/sessions ---
