@@ -67,18 +67,16 @@ fn build_env_explain() -> Option<pistui::explain::ExplainClient> {
 
     // ANTHROPIC_API_KEY needs a different base_url — the Anthropic API is not
     // OpenAI-compatible. Users should set LLM_BASE_URL alongside it.
-    if api_key.is_none() {
-        if let Ok(anthropic_key) = std::env::var("ANTHROPIC_API_KEY") {
-            if std::env::var("LLM_BASE_URL").is_err() {
-                eprintln!(
-                    "warning: ANTHROPIC_API_KEY is set but LLM_BASE_URL is not — \
-                     set LLM_BASE_URL to the Anthropic-compatible endpoint and LLM_MODEL \
-                     to use it for explain"
-                );
-                let _ = anthropic_key;
-                return None;
-            }
-        }
+    if api_key.is_none()
+        && std::env::var("ANTHROPIC_API_KEY").is_ok()
+        && std::env::var("LLM_BASE_URL").is_err()
+    {
+        eprintln!(
+            "warning: ANTHROPIC_API_KEY is set but LLM_BASE_URL is not — \
+             set LLM_BASE_URL to the Anthropic-compatible endpoint and LLM_MODEL \
+             to use it for explain"
+        );
+        return None;
     }
 
     let api_key = api_key?;
