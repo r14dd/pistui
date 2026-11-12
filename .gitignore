@@ -3,3 +3,4 @@
 *.pdb
 .venv/
 /node_modules
+graphify-out/
